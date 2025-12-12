@@ -1,0 +1,1174 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+from dataclasses import dataclass
+from typing import Tuple
+
+try:
+    from scipy import fftpack, ndimage
+except ImportError as e:
+    raise RuntimeError("SciPy is required for this demo.") from e
+
+
+ArrayF = np.ndarray
+ArrayB = np.ndarray
+
+
+# =========================
+# Data containers
+# =========================
+
+@dataclass
+class PitchEstimationResult:
+    pitch_px: float
+    phase_px: float
+    profile: ArrayF
+    detrended_profile: ArrayF
+    freqs: ArrayF
+    power_spectrum: ArrayF
+
+
+@dataclass
+class GoldPeriodResult:
+    gold_period: ArrayF
+    T_star: float
+    phi: float
+    cells: ArrayF
+    cells_aligned: ArrayF
+
+
+@dataclass
+class ModelImageResult:
+    model_image: ArrayF
+    gold_period: ArrayF
+    T_star: float
+    phi: float
+
+
+@dataclass
+class DisplacementFieldResult:
+    displacement: ArrayF
+    sparse_displacement: ArrayF  # here we'll store row-wise shifts
+
+
+@dataclass
+class SegmentationResult:
+    model_mask: ArrayB
+    aligned_image: ArrayF
+    model_image: ArrayF
+
+
+# =========================
+# Helpers
+# =========================
+
+def detrend_poly(profile: ArrayF, degree: int = 3) -> Tuple[ArrayF, ArrayF]:
+    x = np.arange(profile.size, dtype=float)
+    coeffs = np.polyfit(x, profile.astype(float), degree)
+    poly_vals = np.polyval(coeffs, x)
+    detrended = profile.astype(float) - poly_vals
+    return detrended, poly_vals
+
+
+def fft_pitch_and_phase(
+    profile: ArrayF,
+    min_pitch_px: float,
+    max_pitch_px: float,
+    sampling: float = 1.0,
+) -> PitchEstimationResult:
+    profile = np.asarray(profile, dtype=float)
+    N = profile.size
+
+    F = fftpack.fft(profile)
+    freqs = fftpack.fftfreq(N, d=sampling)
+    power = np.abs(F) ** 2
+
+    pos_mask = freqs > 0
+    freqs_pos = freqs[pos_mask]
+    power_pos = power[pos_mask]
+
+    f_min = 1.0 / max_pitch_px
+    f_max = 1.0 / min_pitch_px
+    freq_range_mask = (freqs_pos >= f_min) & (freqs_pos <= f_max)
+    if not np.any(freq_range_mask):
+        raise RuntimeError("No FFT frequencies in requested pitch range.")
+
+    idx_candidates = np.where(freq_range_mask)[0]
+    local_idx = idx_candidates[np.argmax(power_pos[freq_range_mask])]
+    k0 = np.where(pos_mask)[0][local_idx]
+
+    def parabolic_interpolation(power_arr: ArrayF, k: int) -> float:
+        if k <= 0 or k >= power_arr.size - 1:
+            return float(k)
+        a = power_arr[k - 1]
+        b = power_arr[k]
+        c = power_arr[k + 1]
+        denom = (a - 2 * b + c)
+        if abs(denom) < 1e-12:
+            return float(k)
+        delta = 0.5 * (a - c) / denom
+        return float(k) + float(delta)
+
+    k_star = parabolic_interpolation(power, k0)
+    f_star = k_star / N / sampling
+    T_star = 1.0 / f_star
+
+    C = F[k0]
+    theta = np.angle(C)
+    x0 = (-theta / (2.0 * np.pi)) / f_star
+    phi = float(np.mod(x0, T_star))
+
+    return PitchEstimationResult(
+        pitch_px=float(T_star),
+        phase_px=float(phi),
+        profile=profile,
+        detrended_profile=profile,
+        freqs=freqs_pos,
+        power_spectrum=power_pos,
+    )
+
+
+def compute_valid_cell_indices(width: int, T_star: float, phi: float) -> np.ndarray:
+    phi = float(np.mod(phi, T_star))
+    n_min = int(np.ceil((-phi) / T_star))
+    n_max = int(np.floor((width - phi) / T_star - 1.0))
+    if n_max < n_min:
+        return np.array([], dtype=int)
+    return np.arange(n_min, n_max + 1, dtype=int)
+
+
+def sample_cells(img: ArrayF, T_star: float, phi: float, oversample: int = 1):
+    img = np.asarray(img, dtype=float)
+    H, W = img.shape
+    T_eff = float(T_star)
+    phi = float(np.mod(phi, T_eff))
+
+    n_indices = compute_valid_cell_indices(W, T_eff, phi)
+    if n_indices.size == 0:
+        raise RuntimeError("No full periods for given T_star, phi.")
+
+    Tg = int(np.round(T_eff * oversample))
+    u_grid = np.linspace(0.0, T_eff, Tg, endpoint=False)
+
+    cells = np.empty((n_indices.size, H, Tg), dtype=float)
+    y_coords = np.arange(H, dtype=float)
+    y_grid, u_grid_b = np.meshgrid(y_coords, u_grid, indexing="ij")
+
+    for idx, n in enumerate(n_indices):
+        cell_start = phi + n * T_eff
+        x_coords = cell_start + u_grid_b
+        coords = np.stack([y_grid, x_coords], axis=0)
+        cell = ndimage.map_coordinates(img, coords, order=1, mode="nearest")
+        cells[idx] = cell
+
+    return cells, T_eff
+
+
+def robust_median(cells: ArrayF) -> ArrayF:
+    return np.median(cells, axis=0)
+
+
+def align_cells_to_template(cells: ArrayF, template: ArrayF, max_shift_frac: float = 0.2):
+    N, H, Tg = cells.shape
+    max_shift = int(np.round(max_shift_frac * Tg))
+    cells_aligned = np.empty_like(cells)
+
+    temp_rows = template - template.mean(axis=1, keepdims=True)
+    temp_rows /= (np.linalg.norm(temp_rows, axis=1, keepdims=True) + 1e-12)
+
+    u = np.arange(Tg, dtype=float)
+
+    for n in range(N):
+        cell = cells[n]
+        cell_aligned = np.empty_like(cell)
+        for y in range(H):
+            row = cell[y]
+            row0 = row - row.mean()
+            norm = np.linalg.norm(row0)
+            if norm < 1e-12:
+                cell_aligned[y] = row
+                continue
+            row0 /= norm
+
+            shift_range = np.arange(-max_shift, max_shift + 1, dtype=float)
+            corrs = []
+            for s in shift_range:
+                x_shifted = u + s
+                coords = np.stack(
+                    [np.full_like(x_shifted, y, dtype=float), x_shifted], axis=0
+                )
+                row_shifted = ndimage.map_coordinates(
+                    cell, coords, order=1, mode="nearest"
+                )
+                row_shifted0 = row_shifted - row_shifted.mean()
+                norm_shifted = np.linalg.norm(row_shifted0)
+                if norm_shifted < 1e-12:
+                    corrs.append(-np.inf)
+                    continue
+                row_shifted0 /= norm_shifted
+                corr = float(np.dot(row_shifted0, temp_rows[y]))
+                corrs.append(corr)
+            corrs = np.asarray(corrs)
+            best_idx = int(np.argmax(corrs))
+            best_shift = shift_range[best_idx]
+
+            if 0 < best_idx < len(shift_range) - 1:
+                a = corrs[best_idx - 1]
+                b = corrs[best_idx]
+                c = corrs[best_idx + 1]
+                denom = (a - 2 * b + c)
+                if abs(denom) > 1e-8:
+                    delta = 0.5 * (a - c) / denom
+                    best_shift += float(delta)
+
+            x_shifted_best = u + best_shift
+            coords_best = np.stack(
+                [np.full_like(x_shifted_best, y, dtype=float), x_shifted_best], axis=0
+            )
+            row_best = ndimage.map_coordinates(
+                cell, coords_best, order=1, mode="nearest"
+            )
+            cell_aligned[y] = row_best
+        cells_aligned[n] = cell_aligned
+    return cells_aligned
+
+
+def build_gold_period(
+    img: ArrayF,
+    T_star: float,
+    phi: float,
+    oversample: int = 1,
+    max_shift_frac: float = 0.2,
+) -> GoldPeriodResult:
+    cells, T_eff = sample_cells(img, T_star, phi, oversample=oversample)
+    G0 = robust_median(cells)
+    cells_aligned = align_cells_to_template(cells, G0, max_shift_frac=max_shift_frac)
+    G = robust_median(cells_aligned)
+    return GoldPeriodResult(
+        gold_period=G,
+        T_star=T_eff,
+        phi=phi,
+        cells=cells,
+        cells_aligned=cells_aligned,
+    )
+
+
+def build_model_image(gold_period: ArrayF, T_star: float, phi: float, width: int) -> ArrayF:
+    G = np.asarray(gold_period, dtype=float)
+    H, Tg = G.shape
+    T_eff = float(T_star)
+    phi = float(np.mod(phi, T_eff))
+
+    x_coords = np.arange(width, dtype=float)
+    u_x = np.mod(x_coords - phi, T_eff)
+    u_grid = np.linspace(0.0, T_eff, Tg, endpoint=False)
+    model = np.empty((H, width), dtype=float)
+
+    for y in range(H):
+        row = G[y]
+        u_ext = np.concatenate([u_grid, [T_eff]])
+        row_ext = np.concatenate([row, [row[0]]])
+        model[y] = np.interp(u_x, u_ext, row_ext)
+    return model
+
+
+# Row-wise registration: same shift for all x per row
+def rowwise_registration(
+    img: ArrayF,
+    model: ArrayF,
+    T_star: float,
+    max_shift_frac: float = 0.25,
+    shift_step: float = 0.25,
+) -> DisplacementFieldResult:
+    img = np.asarray(img, dtype=float)
+    model = np.asarray(model, dtype=float)
+    H, W = img.shape
+    max_shift = float(max_shift_frac * T_star)
+    shift_range = np.arange(-max_shift, max_shift + 1e-6, shift_step, dtype=float)
+
+    displacement = np.zeros((H, W), dtype=float)
+    row_shifts = np.zeros(H, dtype=float)
+
+    x = np.arange(W, dtype=float)
+
+    for y in range(H):
+        rowI = img[y]
+        rowM = model[y]
+        rowM0 = rowM - rowM.mean()
+        normM = np.linalg.norm(rowM0)
+        if normM < 1e-12:
+            continue
+        rowM0 /= normM
+
+        best_shift = 0.0
+        best_corr = -np.inf
+
+        for s in shift_range:
+            x_shift = x + s
+            coords = np.stack(
+                [np.full_like(x_shift, y, dtype=float), x_shift], axis=0
+            )
+            rowI_shift = ndimage.map_coordinates(img, coords, order=1, mode="nearest")
+            rowI0 = rowI_shift - rowI_shift.mean()
+            normI = np.linalg.norm(rowI0)
+            if normI < 1e-12:
+                continue
+            rowI0 /= normI
+            corr = float(np.dot(rowI0, rowM0))
+            if corr > best_corr:
+                best_corr = corr
+                best_shift = float(s)
+
+        displacement[y, :] = best_shift
+        row_shifts[y] = best_shift
+
+    sparse = np.tile(row_shifts[:, None], (1, W))
+    return DisplacementFieldResult(displacement=displacement, sparse_displacement=sparse)
+
+
+def warp_lateral(img: ArrayF, displacement: ArrayF) -> ArrayF:
+    img = np.asarray(img, dtype=float)
+    d = np.asarray(displacement, dtype=float)
+    H, W = img.shape
+    y_coords, x_coords = np.meshgrid(
+        np.arange(H, dtype=float), np.arange(W, dtype=float), indexing="ij"
+    )
+    x_sample = x_coords + d
+    coords = np.stack([y_coords, x_sample], axis=0)
+    aligned = ndimage.map_coordinates(img, coords, order=1, mode="nearest")
+    return aligned
+
+
+def otsu_threshold(image: ArrayF, nbins: int = 256) -> float:
+    img = image.astype(float)
+    img_min = img.min()
+    img_max = img.max()
+    if img_max <= img_min + 1e-12:
+        return float(img_min)
+    hist, bin_edges = np.histogram(img, bins=nbins, range=(img_min, img_max))
+    hist = hist.astype(float)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    weight1 = np.cumsum(hist)
+    weight2 = np.cumsum(hist[::-1])[::-1]
+
+    mean1 = np.cumsum(hist * bin_centers) / (weight1 + 1e-12)
+    mean2 = (np.cumsum((hist * bin_centers)[::-1]) / (weight2[::-1] + 1e-12))[::-1]
+
+    var_between = weight1[:-1] * weight2[1:] * (mean1[:-1] - mean2[1:]) ** 2
+    idx = np.argmax(var_between)
+    threshold = bin_centers[idx]
+    return float(threshold)
+
+
+def segment_lines_on_model(model_image: ArrayF, min_object_size: int = 50) -> ArrayB:
+    model = np.asarray(model_image, dtype=float)
+    thresh = otsu_threshold(model)
+    mask = model > thresh
+
+    structure = np.ones((3, 3), dtype=bool)
+    mask = ndimage.binary_closing(mask, structure=structure)
+
+    labeled, num = ndimage.label(mask)
+    if num == 0:
+        return mask
+    counts = np.bincount(labeled.ravel())
+    remove = counts < min_object_size
+    remove[0] = False
+    mask_clean = remove[labeled]
+    mask[labeled > 0] &= ~mask_clean
+    return mask
+
+
+def full_pipeline(
+    img: ArrayF,
+    min_pitch_px: float,
+    max_pitch_px: float,
+    oversample: int = 1,
+    pitch_poly_degree: int = 3,
+):
+    img = np.asarray(img, dtype=float)
+    H, W = img.shape
+
+    profile = np.median(img, axis=0)
+    detrended, poly_vals = detrend_poly(profile, degree=pitch_poly_degree)
+
+    pitch_res_raw = fft_pitch_and_phase(
+        detrended, min_pitch_px=min_pitch_px, max_pitch_px=max_pitch_px, sampling=1.0
+    )
+    pitch_res = PitchEstimationResult(
+        pitch_px=pitch_res_raw.pitch_px,
+        phase_px=pitch_res_raw.phase_px,
+        profile=profile,
+        detrended_profile=detrended,
+        freqs=pitch_res_raw.freqs,
+        power_spectrum=pitch_res_raw.power_spectrum,
+    )
+
+    gold_res = build_gold_period(
+        img, T_star=pitch_res.pitch_px, phi=pitch_res.phase_px,
+        oversample=oversample, max_shift_frac=0.2
+    )
+
+    model_img = build_model_image(
+        gold_res.gold_period, T_star=gold_res.T_star, phi=gold_res.phi, width=W
+    )
+    model_res = ModelImageResult(
+        model_image=model_img,
+        gold_period=gold_res.gold_period,
+        T_star=gold_res.T_star,
+        phi=gold_res.phi,
+    )
+
+    disp_res = rowwise_registration(
+        img, model_img, T_star=pitch_res.pitch_px,
+        max_shift_frac=0.25, shift_step=0.25
+    )
+
+    aligned_img = warp_lateral(img, disp_res.displacement)
+    model_mask = segment_lines_on_model(model_img)
+    seg_res = SegmentationResult(
+        model_mask=model_mask,
+        aligned_image=aligned_img,
+        model_image=model_img,
+    )
+
+    return pitch_res, gold_res, model_res, disp_res, seg_res
+#============================================================================
+
+
+import numpy as np
+from scipy import fftpack, ndimage
+
+# ============================================================
+# Core pipeline functions
+# ============================================================
+
+def detrend_poly(profile, degree: int = 3):
+    """
+    Fit and subtract a low-order polynomial from a 1D profile.
+    Returns (detrended_profile, fitted_polynomial_values).
+    """
+    x = np.arange(profile.size, dtype=float)
+    coeffs = np.polyfit(x, profile.astype(float), degree)
+    poly_vals = np.polyval(coeffs, x)
+    detrended = profile.astype(float) - poly_vals
+    return detrended, poly_vals
+
+
+def fft_pitch_and_phase(profile, min_pitch_px, max_pitch_px, sampling: float = 1.0):
+    """
+    Estimate dominant spatial period and phase using FFT + parabolic peak refinement.
+
+    profile      : 1D array (e.g., median over rows).
+    min_pitch_px : lower bound for period search (pixels).
+    max_pitch_px : upper bound for period search (pixels).
+    sampling     : pixel spacing (usually 1.0).
+
+    Returns:
+        T_star     : estimated period (pixels),
+        phi        : estimated phase offset (in pixels, [0, T_star)),
+        freqs_pos  : positive frequencies,
+        power_pos  : power spectrum at positive freqs.
+    """
+    profile = np.asarray(profile, dtype=float)
+    N = profile.size
+    F = fftpack.fft(profile)
+    freqs = fftpack.fftfreq(N, d=sampling)
+    power = np.abs(F) ** 2
+
+    # Positive freqs only
+    pos_mask = freqs > 0
+    freqs_pos = freqs[pos_mask]
+    power_pos = power[pos_mask]
+
+    # Restrict to frequency band
+    f_min = 1.0 / max_pitch_px
+    f_max = 1.0 / min_pitch_px
+    freq_range_mask = (freqs_pos >= f_min) & (freqs_pos <= f_max)
+    if not np.any(freq_range_mask):
+        raise RuntimeError("No FFT frequencies in requested pitch range.")
+
+    idx_candidates = np.where(freq_range_mask)[0]
+    local_idx = idx_candidates[np.argmax(power_pos[freq_range_mask])]
+
+    # Map back to full-spectrum index
+    k0 = np.where(pos_mask)[0][local_idx]
+
+    def parabolic_interpolation(power_arr, k: int) -> float:
+        """
+        Standard 3-point parabolic refinement around peak index k.
+        Returns sub-bin index estimate k_star.
+        """
+        if k <= 0 or k >= power_arr.size - 1:
+            return float(k)
+        a = power_arr[k - 1]
+        b = power_arr[k]
+        c = power_arr[k + 1]
+        denom = (a - 2 * b + c)
+        if abs(denom) < 1e-12:
+            return float(k)
+        delta = 0.5 * (a - c) / denom
+        return float(k) + float(delta)
+
+    # Sub-bin refined frequency
+    k_star = parabolic_interpolation(power, k0)
+    f_star = k_star / N / sampling
+    T_star = 1.0 / f_star
+
+    # Phase from complex coefficient at k0 (coarse)
+    C = F[k0]
+    theta = np.angle(C)
+    # Convert phase to spatial shift (in pixels), then to phase in [0, T_star)
+    x0 = (-theta / (2.0 * np.pi)) / f_star
+    phi = float(np.mod(x0, T_star))
+    return T_star, phi, freqs_pos, power_pos
+
+
+def compute_valid_cell_indices(width: int, T_star: float, phi: float):
+    """
+    Compute integer cell indices such that each cell spans a *full* period
+    fully inside [0, width).
+
+    Each cell is [phi + n*T_star, phi + (n+1)*T_star).
+    """
+    phi = float(np.mod(phi, T_star))
+    n_min = int(np.ceil((-phi) / T_star))
+    n_max = int(np.floor((width - phi) / T_star - 1.0))
+    if n_max < n_min:
+        return np.array([], dtype=int)
+    return np.arange(n_min, n_max + 1, dtype=int)
+
+
+def sample_cells(img, T_star: float, phi: float, oversample: int = 1):
+    """
+    Extract all full-period "cells" from the image, with optional oversampling
+    in the periodic coordinate.
+
+    Returns:
+        cells : array (N_cells, H, Tg),
+        T_eff : effective period (same as T_star, float).
+    """
+    img = np.asarray(img, dtype=float)
+    H, W = img.shape
+    T_eff = float(T_star)
+    phi = float(np.mod(phi, T_eff))
+
+    n_indices = compute_valid_cell_indices(W, T_eff, phi)
+    if n_indices.size == 0:
+        raise RuntimeError("No full periods for given T_star, phi.")
+
+    Tg = int(np.round(T_eff * oversample))
+    u_grid = np.linspace(0.0, T_eff, Tg, endpoint=False)
+
+    cells = np.empty((n_indices.size, H, Tg), dtype=float)
+    y_coords = np.arange(H, dtype=float)
+    y_grid, u_grid_b = np.meshgrid(y_coords, u_grid, indexing="ij")
+
+    for idx, n in enumerate(n_indices):
+        cell_start = phi + n * T_eff
+        x_coords = cell_start + u_grid_b
+        coords = np.stack([y_grid, x_coords], axis=0)
+        cell = ndimage.map_coordinates(img, coords, order=1, mode="nearest")
+        cells[idx] = cell
+
+    return cells, T_eff
+
+
+def robust_median(cells):
+    """
+    Cell-wise median across samples (robust gold template builder).
+    cells: (N, H, Tg).
+    """
+    return np.median(cells, axis=0)
+
+
+def align_cells_to_template(cells, template, max_shift_frac: float = 0.2):
+    """
+    Align each cell to a template using row-wise 1D cross-correlation over a limited
+    shift range (in units of sample index).
+    """
+    N, H, Tg = cells.shape
+    max_shift = int(np.round(max_shift_frac * Tg))
+    cells_aligned = np.empty_like(cells)
+
+    # Normalized template rows
+    temp_rows = template - template.mean(axis=1, keepdims=True)
+    temp_rows /= (np.linalg.norm(temp_rows, axis=1, keepdims=True) + 1e-12)
+
+    u = np.arange(Tg, dtype=float)
+
+    for n in range(N):
+        cell = cells[n]
+        cell_aligned = np.empty_like(cell)
+        for y in range(H):
+            row = cell[y]
+            row0 = row - row.mean()
+            norm = np.linalg.norm(row0)
+            if norm < 1e-12:
+                cell_aligned[y] = row
+                continue
+            row0 /= norm
+
+            shift_range = np.arange(-max_shift, max_shift + 1, dtype=float)
+            corrs = []
+            for s in shift_range:
+                x_shifted = u + s
+                coords = np.stack(
+                    [np.full_like(x_shifted, y, dtype=float), x_shifted], axis=0
+                )
+                row_shifted = ndimage.map_coordinates(
+                    cell, coords, order=1, mode="nearest"
+                )
+                row_shifted0 = row_shifted - row_shifted.mean()
+                norm_shifted = np.linalg.norm(row_shifted0)
+                if norm_shifted < 1e-12:
+                    corrs.append(-np.inf)
+                    continue
+                row_shifted0 /= norm_shifted
+                corr = float(np.dot(row_shifted0, temp_rows[y]))
+                corrs.append(corr)
+            corrs = np.asarray(corrs)
+            best_idx = int(np.argmax(corrs))
+            best_shift = shift_range[best_idx]
+
+            # Optional quadratic refinement on correlation peak
+            if 0 < best_idx < len(shift_range) - 1:
+                a = corrs[best_idx - 1]
+                b = corrs[best_idx]
+                c = corrs[best_idx + 1]
+                denom = (a - 2 * b + c)
+                if abs(denom) > 1e-8:
+                    delta = 0.5 * (a - c) / denom
+                    best_shift += float(delta)
+
+            x_shifted_best = u + best_shift
+            coords_best = np.stack(
+                [np.full_like(x_shifted_best, y, dtype=float), x_shifted_best], axis=0
+            )
+            row_best = ndimage.map_coordinates(
+                cell, coords_best, order=1, mode="nearest"
+            )
+            cell_aligned[y] = row_best
+        cells_aligned[n] = cell_aligned
+    return cells_aligned
+
+
+def build_gold_period(img, T_star: float, phi: float, oversample: int = 1):
+    """
+    Build a gold-period template from the input image:
+    1. Sample all full cells.
+    2. Median template (G0).
+    3. Row-wise alignment to G0.
+    4. Median again -> G (gold period).
+    """
+    cells, T_eff = sample_cells(img, T_star, phi, oversample=oversample)
+    G0 = robust_median(cells)
+    cells_aligned = align_cells_to_template(cells, G0, max_shift_frac=0.2)
+    G = robust_median(cells_aligned)
+    # Note: return aligned cells and raw cells for debugging if needed
+    return G, T_eff, cells_aligned, cells
+
+
+def build_model_image(gold_period, T_star: float, phi: float, width: int):
+    """
+    Tile the gold period along x to the full width with correct phase.
+    """
+    G = np.asarray(gold_period, dtype=float)
+    H, Tg = G.shape
+    T_eff = float(T_star)
+    phi = float(np.mod(phi, T_eff))
+
+    x_coords = np.arange(width, dtype=float)
+    u_x = np.mod(x_coords - phi, T_eff)
+    u_grid = np.linspace(0.0, T_eff, Tg, endpoint=False)
+    model = np.empty((H, width), dtype=float)
+
+    for y in range(H):
+        row = G[y]
+        u_ext = np.concatenate([u_grid, [T_eff]])
+        row_ext = np.concatenate([row, [row[0]]])
+        model[y] = np.interp(u_x, u_ext, row_ext)
+    return model
+
+
+def rowwise_registration(img, model, T_star: float,
+                         max_shift_frac: float = 0.25,
+                         shift_step: float = 0.25):
+    """
+    Register each row of img laterally to corresponding row of model by
+    brute-force shift search in 1D with normalized cross-correlation.
+
+    Returns:
+        displacement : (H, W) array, row-constant shift field.
+        sparse       : (H, W) array, explicitly tiled row shifts.
+    """
+    img = np.asarray(img, dtype=float)
+    model = np.asarray(model, dtype=float)
+    H, W = img.shape
+    max_shift = float(max_shift_frac * T_star)
+    shift_range = np.arange(-max_shift, max_shift + 1e-6, shift_step, dtype=float)
+
+    displacement = np.zeros((H, W), dtype=float)
+    row_shifts = np.zeros(H, dtype=float)
+    x = np.arange(W, dtype=float)
+
+    for y in range(H):
+        rowM = model[y]
+        rowM0 = rowM - rowM.mean()
+        normM = np.linalg.norm(rowM0)
+        if normM < 1e-12:
+            continue
+        rowM0 /= normM
+
+        best_shift = 0.0
+        best_corr = -np.inf
+        for s in shift_range:
+            x_shift = x + s
+            coords = np.stack(
+                [np.full_like(x_shift, y, dtype=float), x_shift], axis=0
+            )
+            rowI_shift = ndimage.map_coordinates(img, coords, order=1, mode="nearest")
+            rowI0 = rowI_shift - rowI_shift.mean()
+            normI = np.linalg.norm(rowI0)
+            if normI < 1e-12:
+                continue
+            rowI0 /= normI
+            corr = float(np.dot(rowI0, rowM0))
+            if corr > best_corr:
+                best_corr = corr
+                best_shift = float(s)
+        displacement[y, :] = best_shift
+        row_shifts[y] = best_shift
+
+    sparse = np.tile(row_shifts[:, None], (1, W))
+    return displacement, sparse
+
+
+def warp_lateral(img, displacement):
+    """
+    Apply a lateral warp (x + displacement[y,x]) using bilinear interpolation.
+    """
+    img = np.asarray(img, dtype=float)
+    d = np.asarray(displacement, dtype=float)
+    H, W = img.shape
+    y_coords, x_coords = np.meshgrid(
+        np.arange(H, dtype=float), np.arange(W, dtype=float), indexing="ij"
+    )
+    x_sample = x_coords + d
+    coords = np.stack([y_coords, x_sample], axis=0)
+    aligned = ndimage.map_coordinates(img, coords, order=1, mode="nearest")
+    return aligned
+
+
+def otsu_threshold(image, nbins: int = 256) -> float:
+    """
+    Standard Otsu threshold (implemented on float-valued images).
+    """
+    img = image.astype(float)
+    img_min = img.min()
+    img_max = img.max()
+    if img_max <= img_min + 1e-12:
+        return float(img_min)
+    hist, bin_edges = np.histogram(img, bins=nbins, range=(img_min, img_max))
+    hist = hist.astype(float)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    weight1 = np.cumsum(hist)
+    weight2 = np.cumsum(hist[::-1])[::-1]
+
+    mean1 = np.cumsum(hist * bin_centers) / (weight1 + 1e-12)
+    mean2 = (np.cumsum((hist * bin_centers)[::-1]) /
+             (weight2[::-1] + 1e-12))[::-1]
+
+    var_between = weight1[:-1] * weight2[1:] * (mean1[:-1] - mean2[1:]) ** 2
+    idx = np.argmax(var_between)
+    threshold = bin_centers[idx]
+    return float(threshold)
+
+
+def segment_lines_on_model(model_image, min_object_size: int = 50):
+    """
+    Segment bright periodic lines on the model image:
+      - Otsu threshold,
+      - small morphological closing,
+      - remove small connected components.
+    """
+    model = np.asarray(model_image, dtype=float)
+    thresh = otsu_threshold(model)
+    mask = model > thresh
+
+    structure = np.ones((3, 3), dtype=bool)
+    mask = ndimage.binary_closing(mask, structure=structure)
+
+    labeled, num = ndimage.label(mask)
+    if num == 0:
+        return mask
+
+    counts = np.bincount(labeled.ravel())
+    for label_val in range(1, num + 1):
+        if counts[label_val] < min_object_size:
+            mask[labeled == label_val] = False
+    return mask
+
+
+def full_pipeline(img, min_pitch_px, max_pitch_px,
+                  oversample: int = 1,
+                  pitch_poly_degree: int = 3):
+    """
+    End-to-end pipeline:
+
+    1. Estimate pitch + phase from median profile.
+    2. Build gold period.
+    3. Build full model image by tiling gold period.
+    4. Row-wise 1D registration to get lateral displacement field.
+    5. Warp original image to the model geometry.
+    6. Segment lines on the model.
+
+    Returns a dict with:
+      - pitch, phase,
+      - gold_period, model_image,
+      - displacement, sparse_displacement,
+      - aligned_image,
+      - model_mask,
+      - profile, detrended_profile,
+      - freqs_pos, power_pos.
+    """
+    img = np.asarray(img, dtype=float)
+    H, W = img.shape
+
+    # 1. Global pitch estimate
+    profile = np.median(img, axis=0)
+    detrended, _ = detrend_poly(profile, degree=pitch_poly_degree)
+    T_hat, phi_hat, freqs_pos, power_pos = fft_pitch_and_phase(
+        detrended,
+        min_pitch_px=min_pitch_px,
+        max_pitch_px=max_pitch_px,
+        sampling=1.0,
+    )
+
+    # 2. Gold period
+    G_hat, T_eff, cells_aligned, cells = build_gold_period(
+        img, T_star=T_hat, phi=phi_hat, oversample=oversample
+    )
+
+    # 3. Model image
+    model_img = build_model_image(G_hat, T_star=T_eff, phi=phi_hat, width=W)
+
+    # 4. Row-wise registration
+    disp, sparse = rowwise_registration(
+        img, model_img, T_star=T_hat,
+        max_shift_frac=0.25, shift_step=0.25
+    )
+
+    # 5. Warp original to model grid
+    aligned_img = warp_lateral(img, disp)
+
+    # 6. Segment on model
+    mask = segment_lines_on_model(model_img)
+
+    return {
+        "pitch": T_hat,
+        "phase": phi_hat,
+        "gold_period": G_hat,
+        "model_image": model_img,
+        "displacement": disp,
+        "sparse_displacement": sparse,
+        "aligned_image": aligned_img,
+        "model_mask": mask,
+        "profile": profile,
+        "detrended_profile": detrended,
+        "freqs_pos": freqs_pos,
+        "power_pos": power_pos,
+    }
+
+
+# ============================================================
+# Synthetic ground-truth helpers (for testing / validation)
+# ============================================================
+
+def make_base_template(T_true: float,
+                       H: int,
+                       line_width: float = 2.0,
+                       background: float = 80.0,
+                       peak: float = 140.0):
+    """
+    Build a clean H×Tg template period: single bright Gaussian line
+    around the center of the period.
+    """
+    Tg = int(round(T_true))
+    u = np.linspace(0.0, T_true, Tg, endpoint=False)
+    center = 0.5 * T_true
+    base_profile = background + peak * np.exp(-0.5 * ((u - center) / line_width) ** 2)
+    G_true = np.tile(base_profile[None, :], (H, 1))
+    return G_true
+
+
+def tile_template(G: np.ndarray,
+                  T_true: float,
+                  phi: float,
+                  width: int) -> np.ndarray:
+    """
+    Tile a given cell template G across width with phase phi.
+    """
+    H, Tg = G.shape
+    T_eff = float(T_true)
+    phi = float(np.mod(phi, T_eff))
+
+    x_coords = np.arange(width, dtype=float)
+    u_x = np.mod(x_coords - phi, T_eff)
+    u_grid = np.linspace(0.0, T_eff, Tg, endpoint=False)
+
+    model = np.empty((H, width), dtype=float)
+    for y in range(H):
+        row = G[y]
+        u_ext = np.concatenate([u_grid, [T_eff]])
+        row_ext = np.concatenate([row, [row[0]]])
+        model[y] = np.interp(u_x, u_ext, row_ext)
+
+    return model
+
+
+def apply_row_shifts(img: np.ndarray, shifts: np.ndarray) -> np.ndarray:
+    """
+    Apply a per-row lateral shift field to an image.
+    Positive shift moves content to the right (sampling from left).
+    """
+    img = np.asarray(img, dtype=float)
+    H, W = img.shape
+    assert shifts.shape == (H,)
+
+    y_coords, x_coords = np.meshgrid(
+        np.arange(H, dtype=float),
+        np.arange(W, dtype=float),
+        indexing="ij",
+    )
+    x_sample = x_coords - shifts[:, None]  # positive shift moves content right
+    coords = np.stack([y_coords, x_sample], axis=0)
+
+    warped = ndimage.map_coordinates(
+        img,
+        coords,
+        order=1,
+        mode="nearest",
+    )
+    return warped
+
+
+def add_gaussian_noise(img: np.ndarray, sigma: float) -> np.ndarray:
+    """
+    Add i.i.d. Gaussian noise.
+    """
+    noisy = img + np.random.randn(*img.shape) * sigma
+    return noisy.astype(float)
+
+
+def make_ground_truth_mask(G_true: np.ndarray, threshold_rel: float = 0.5) -> np.ndarray:
+    """
+    Turn a gold-period template into a binary mask by relative threshold.
+    """
+    vmin = float(G_true.min())
+    vmax = float(G_true.max())
+    thr = vmin + threshold_rel * (vmax - vmin)
+    return G_true > thr
+
+
+# ============================================================
+# Tests (synthetic validation)
+# ============================================================
+
+def test_pitch_estimation_clean():
+    np.random.seed(0)
+    H, W = 128, 512
+    T_true = 36.0
+    phi_true = 5.0
+
+    G_true = make_base_template(T_true, H)
+    model_true = tile_template(G_true, T_true, phi_true, W)
+    img = add_gaussian_noise(model_true, sigma=1.0)
+
+    profile = np.median(img, axis=0)
+    detrended, _ = detrend_poly(profile, degree=1)
+    T_hat, phi_hat, freqs_pos, power_pos = fft_pitch_and_phase(
+        detrended,
+        min_pitch_px=0.8 * T_true,
+        max_pitch_px=1.2 * T_true,
+        sampling=1.0,
+    )
+
+    err_pitch = abs(T_hat - T_true)
+    print("[test_pitch_estimation_clean] T_true=", T_true,
+          "T_hat=", T_hat, "err=", err_pitch)
+    # Relaxed tolerance: 1 px absolute error
+    assert err_pitch < 1.0
+
+
+def test_pitch_estimation_partial_periods():
+    np.random.seed(1)
+    H, W = 128, 430
+    T_true = 28.0
+    phi_true = 13.2
+
+    G_true = make_base_template(T_true, H)
+    model_true = tile_template(G_true, T_true, phi_true, W)
+    img = add_gaussian_noise(model_true, sigma=1.5)
+
+    profile = np.median(img, axis=0)
+    detrended, _ = detrend_poly(profile, degree=2)
+    T_hat, phi_hat, freqs_pos, power_pos = fft_pitch_and_phase(
+        detrended,
+        min_pitch_px=0.8 * T_true,
+        max_pitch_px=1.2 * T_true,
+        sampling=1.0,
+    )
+
+    err_pitch = abs(T_hat - T_true)
+    print("[test_pitch_estimation_partial_periods] T_true=", T_true,
+          "T_hat=", T_hat, "err=", err_pitch)
+    assert err_pitch < 1.0
+
+
+def test_gold_period_reconstruction():
+    np.random.seed(2)
+    H, W = 256, 512
+    T_true = 32.0
+    phi_true = 0.0
+
+    G_true = make_base_template(T_true, H)
+    model_true = tile_template(G_true, T_true, phi_true, W)
+
+    y = np.arange(H, dtype=float)
+    shifts = 2.0 * np.sin(2.0 * np.pi * y / H)
+    img_meander = apply_row_shifts(model_true, shifts)
+    img = add_gaussian_noise(img_meander, sigma=2.0)
+
+    G_hat, T_eff, cells_aligned, cells = build_gold_period(
+        img,
+        T_star=T_true,
+        phi=phi_true,
+        oversample=1,
+    )
+
+    assert G_hat.shape == G_true.shape
+    diff = G_hat - G_true
+    rmse = np.sqrt(np.mean(diff ** 2))
+    dyn = G_true.max() - G_true.min()
+    rel_rmse = rmse / (dyn + 1e-12)
+
+    print("[test_gold_period_reconstruction] RMSE=", rmse,
+          "relative RMSE=", rel_rmse)
+    # Empirically robust threshold for this synthetic setup
+    assert rel_rmse < 0.2
+
+
+def test_registration_recovers_known_shifts():
+    np.random.seed(3)
+    H, W = 200, 400
+    T_true = 30.0
+    phi_true = 4.0
+
+    G_true = make_base_template(T_true, H)
+    model_true = tile_template(G_true, T_true, phi_true, W)
+
+    y = np.arange(H, dtype=float)
+    shifts_true = 1.5 * np.sin(2 * np.pi * y / H) + 0.5 * np.cos(4 * np.pi * y / H)
+    img_warped = apply_row_shifts(model_true, shifts_true)
+    img = add_gaussian_noise(img_warped, sigma=1.5)
+
+    disp, sparse = rowwise_registration(
+        img,
+        model_true,
+        T_star=T_true,
+        max_shift_frac=0.3,
+        shift_step=0.25,
+    )
+    shifts_hat = np.mean(disp, axis=1)
+
+    err = shifts_hat - shifts_true
+    max_abs_err = np.max(np.abs(err))
+    mae = np.mean(np.abs(err))
+
+    print("[test_registration_recovers_known_shifts] max_abs_err=", max_abs_err,
+          "MAE=", mae)
+    assert max_abs_err < 0.5
+    assert mae < 0.3
+
+
+def test_segmentation_iou_on_clean_model():
+    np.random.seed(4)
+    H, W = 256, 512
+    T_true = 34.0
+    phi_true = 0.0
+
+    G_true = make_base_template(T_true, H)
+    model_true = tile_template(G_true, T_true, phi_true, W)
+
+    mask_gt_cell = make_ground_truth_mask(G_true, threshold_rel=0.5)
+    mask_gt_tiled = tile_template(mask_gt_cell.astype(float),
+                                  T_true, phi_true, W) > 0.5
+
+    mask_pred = segment_lines_on_model(model_true, min_object_size=20)
+
+    inter = np.logical_and(mask_gt_tiled, mask_pred).sum()
+    union = np.logical_or(mask_gt_tiled, mask_pred).sum()
+    iou = inter / (union + 1e-12)
+
+    print("[test_segmentation_iou_on_clean_model] IoU=", iou)
+    assert iou > 0.99
+
+
+def test_full_pipeline_consistency():
+    np.random.seed(5)
+    H, W = 256, 512
+    T_true = 32.0
+    phi_true = 3.0
+
+    G_true = make_base_template(T_true, H)
+    model_true = tile_template(G_true, T_true, phi_true, W)
+
+    y = np.arange(H, dtype=float)
+    shifts_true = 1.0 * np.sin(2 * np.pi * y / H) + 0.7 * np.cos(3 * np.pi * y / H)
+    img_warped = apply_row_shifts(model_true, shifts_true)
+    img = add_gaussian_noise(img_warped, sigma=2.0)
+
+    res = full_pipeline(
+        img,
+        min_pitch_px=0.8 * T_true,
+        max_pitch_px=1.2 * T_true,
+        oversample=1,
+    )
+
+    T_hat = res["pitch"]
+    err_T = abs(T_hat - T_true)
+    print("[test_full_pipeline_consistency] T_true=", T_true,
+          "T_hat=", T_hat, "err=", err_T)
+    assert err_T < 1.0
+
+    M_hat = res["model_image"]
+    M0_hat = M_hat - M_hat.mean()
+    M0_true = model_true - model_true.mean()
+    corr = np.sum(M0_hat * M0_true) / (
+        np.linalg.norm(M0_hat) * np.linalg.norm(M0_true) + 1e-12
+    )
+    print("[test_full_pipeline_consistency] model corr=", corr)
+    assert corr > 0.95
+
+    d_hat = res["displacement"]
+    shifts_hat = np.mean(d_hat, axis=1)
+    err_shift = shifts_hat - shifts_true
+    mae = np.mean(np.abs(err_shift))
+    max_abs = np.max(np.abs(err_shift))
+    print("[test_full_pipeline_consistency] shift MAE=", mae, "max_abs=", max_abs)
+    assert mae < 0.6
+    assert max_abs < 1.2
+
+
+if __name__ == "__main__":
+    np.set_printoptions(precision=3, suppress=True)
+    test_pitch_estimation_clean()
+    test_pitch_estimation_partial_periods()
+    test_gold_period_reconstruction()
+    test_registration_recovers_known_shifts()
+    test_segmentation_iou_on_clean_model()
+    test_full_pipeline_consistency()
+    print("\nALL_TESTS_PASSED")
