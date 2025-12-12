@@ -1,0 +1,837 @@
+"""
+
+Given:
+    - 2D numpy array).
+    - Elliptical ROI (cy, cx, ry, rx, theta_rad).
+
+The pipeline:
+    1. Masks image with the ellipse and normalizes contrast within ROI.
+    2. Enhances bright lines via Sato ridge filter.
+    3. Segments lines in ROI using Otsu thresholding.
+    4. Cleans segmentation and skeletonizes lines to 1-pixel centerlines.
+    5. Labels individual lines and:
+        - Computes per-line "cut" metric (largest gap in skeleton along PCA axis).
+        - Computes "bridge" metric: minimal centerline-to-centerline distance between lines.
+    6. Extracts a cross-section intensity profile between the closest pair of lines
+       and performs a simple sub-pixel edge localization.
+
+Dependencies:
+    numpy, scipy, matplotlib, scikit-image
+
+Author: ChatGPT (for A. Nisani)
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional, List
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+from scipy.ndimage import gaussian_filter, map_coordinates
+from scipy.spatial import cKDTree
+
+from skimage.filters import sato, threshold_otsu
+from skimage.morphology import (
+    remove_small_objects,
+    closing,
+    square,
+    skeletonize,
+)
+from skimage.measure import label, regionprops
+from skimage.feature import canny, structure_tensor, structure_tensor_eigvals
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EllipseROI:
+    """Parametric ellipse ROI in image coordinates."""
+    cy: float
+    cx: float
+    ry: float
+    rx: float
+    theta_rad: float  # rotation in radians, counter-clockwise
+
+
+@dataclass
+class CutMetrics:
+    """Cut metrics per line and global summary."""
+    per_line_max_gap_pixels: Dict[int, float]
+    global_max_gap_pixels: float
+
+
+@dataclass
+class BridgeMetrics:
+    """Bridge metrics between lines."""
+    min_centerline_distance_pixels: float
+    label_pair: Tuple[int, int]
+    point_on_line1: Tuple[float, float]  # (y, x)
+    point_on_line2: Tuple[float, float]  # (y, x)
+    edge_gap_pixels: Optional[float] = None  # optional sub-pixel edge gap
+
+
+@dataclass
+class LineSpaceAnalysisResult:
+    """Container for all outputs."""
+    cut_metrics: CutMetrics
+    bridge_metrics: BridgeMetrics
+    binary_mask: np.ndarray
+    skeleton: np.ndarray
+    labels: np.ndarray
+    orientation_rad: float
+
+
+# ---------------------------------------------------------------------------
+# Debug visualization helper
+# ---------------------------------------------------------------------------
+
+class DebugVisualizer:
+    """Helper to generate debug plots at each pipeline step."""
+
+    def __init__(
+        self,
+        enabled: bool = True,
+        save_dir: Optional[str] = None,
+        dpi: int = 120,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        enabled : bool
+            If False, no figures are created.
+        save_dir : str or None
+            If provided, figures are saved there; otherwise plt.show() is called.
+        dpi : int
+            Figure DPI.
+        """
+        self.enabled = enabled
+        self.save_dir = save_dir
+        self.dpi = dpi
+
+    def show_image(
+        self,
+        img: np.ndarray,
+        title: str,
+        cmap: str = "gray",
+        overlay: Optional[np.ndarray] = None,
+        overlay_cmap: str = "jet",
+        overlay_alpha: float = 0.4,
+    ) -> None:
+        if not self.enabled:
+            return
+
+        fig, ax = plt.subplots(figsize=(6, 6), dpi=self.dpi)
+        ax.imshow(img, cmap=cmap)
+        ax.set_title(title)
+        ax.axis("off")
+
+        if overlay is not None:
+            # Make overlay transparent outside its valid mask
+            overlay_mask = np.isnan(overlay)
+            overlay_to_show = overlay.copy()
+            overlay_to_show[overlay_mask] = 0.0
+            ax.imshow(
+                overlay_to_show,
+                cmap=overlay_cmap,
+                alpha=np.where(overlay_mask, 0.0, overlay_alpha),
+            )
+
+        fig.tight_layout()
+
+        if self.save_dir is not None:
+            from pathlib import Path
+            fname = title.replace(" ", "_").replace("/", "_") + ".png"
+            out_path = Path(self.save_dir) / fname
+            fig.savefig(out_path)
+            plt.close(fig)
+        else:
+            plt.show()
+
+
+# ---------------------------------------------------------------------------
+# Geometry & masking
+# ---------------------------------------------------------------------------
+
+def create_ellipse_mask(
+    shape: Tuple[int, int],
+    roi: EllipseROI,
+) -> np.ndarray:
+    """
+    Create a boolean mask for an ellipse ROI.
+
+    Parameters
+    ----------
+    shape : (H, W)
+        Image shape.
+    roi : EllipseROI
+        Ellipse parameters.
+
+    Returns
+    -------
+    mask : np.ndarray of bool
+        True inside ellipse, False outside.
+    """
+    h, w = shape
+    yy, xx = np.ogrid[:h, :w]
+
+    cy, cx, ry, rx, theta = roi.cy, roi.cx, roi.ry, roi.rx, roi.theta_rad
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+
+    # Shift coordinates to ellipse center
+    y0 = yy - cy
+    x0 = xx - cx
+
+    # Rotate coordinates into ellipse-aligned frame
+    xr = x0 * cos_t + y0 * sin_t
+    yr = -x0 * sin_t + y0 * cos_t
+
+    mask = (xr ** 2) / (rx ** 2) + (yr ** 2) / (ry ** 2) <= 1.0
+    return mask
+
+
+def normalize_in_roi(
+    image: np.ndarray,
+    mask: np.ndarray,
+    low_percentile: float = 1.0,
+    high_percentile: float = 99.0,
+) -> np.ndarray:
+    """
+    Normalize image contrast within ROI to [0, 1] robustly.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Input image.
+    mask : np.ndarray of bool
+        ROI mask.
+    low_percentile, high_percentile : float
+        Percentiles computed over ROI pixels.
+
+    Returns
+    -------
+    norm_image : np.ndarray
+        Float32 image normalized to [0, 1] (outside ROI left as 0).
+    """
+    image_f = image.astype(np.float32)
+    roi_vals = image_f[mask]
+
+    p_low = np.percentile(roi_vals, low_percentile)
+    p_high = np.percentile(roi_vals, high_percentile)
+    scale = max(p_high - p_low, 1e-6)
+
+    norm = (image_f - p_low) / scale
+    norm = np.clip(norm, 0.0, 1.0)
+    norm[~mask] = 0.0
+    return norm
+
+
+# ---------------------------------------------------------------------------
+# Ridge enhancement & segmentation
+# ---------------------------------------------------------------------------
+
+def enhance_ridges(
+    image_norm: np.ndarray,
+    mask: np.ndarray,
+    sigmas: Tuple[float, ...] = (1.0, 2.0, 3.0),
+) -> np.ndarray:
+    """
+    Enhance bright line-like structures using Sato filter.
+
+    Parameters
+    ----------
+    image_norm : np.ndarray
+        Normalized float image in [0, 1].
+    mask : np.ndarray of bool
+        ROI mask.
+    sigmas : tuple of float
+        Scales for Sato filter.
+
+    Returns
+    -------
+    ridge_response : np.ndarray
+        Sato filter response (float), zero outside ROI.
+    """
+    # Slight smoothing for numerical stability
+    smoothed = gaussian_filter(image_norm, sigma=0.6)
+    smoothed[~mask] = 0.0
+
+    # Bright ridges -> black_ridges=False
+    ridge = sato(smoothed, sigmas=sigmas, black_ridges=False)
+    ridge[~mask] = 0.0
+    return ridge
+
+
+def segment_lines_otsu(
+    ridge_response: np.ndarray,
+    mask: np.ndarray,
+    min_object_size: int = 40,
+) -> np.ndarray:
+    """
+    Segment bright lines inside ROI using Otsu thresholding on ridge response.
+
+    Parameters
+    ----------
+    ridge_response : np.ndarray
+        Output of enhance_ridges.
+    mask : np.ndarray of bool
+        ROI mask.
+    min_object_size : int
+        Remove connected components smaller than this.
+
+    Returns
+    -------
+    binary : np.ndarray of bool
+        Binary mask of segmented lines inside ROI.
+    """
+    vals = ridge_response[mask]
+    if vals.size == 0:
+        raise ValueError("Empty ROI: no pixels inside ellipse.")
+
+    thr = threshold_otsu(vals)
+    binary = ridge_response > thr
+    binary &= mask
+
+    # Morphological cleanup
+    binary = closing(binary, square(3))
+    binary = remove_small_objects(binary, min_size=min_object_size)
+    return binary
+
+
+# ---------------------------------------------------------------------------
+# Orientation & skeleton
+# ---------------------------------------------------------------------------
+
+def estimate_global_orientation(
+    image_norm: np.ndarray,
+    mask: np.ndarray,
+    sigma: float = 1.0,
+) -> float:
+    """
+    Estimate a dominant line orientation (in radians) using structure tensor.
+
+    Parameters
+    ----------
+    image_norm : np.ndarray
+        Normalized image.
+    mask : np.ndarray of bool
+        ROI mask.
+    sigma : float
+        Smoothing parameter for structure tensor.
+
+    Returns
+    -------
+    orientation_rad : float
+        Dominant orientation in radians, modulo pi.
+    """
+    Axx, Axy, Ayy = structure_tensor(image_norm, sigma=sigma)
+    # Eigenvalues/eigenvectors for debugging (not strictly needed)
+    l1, l2 = structure_tensor_eigvals(Axx, Axy, Ayy)
+
+    orientation_field = 0.5 * np.arctan2(2.0 * Axy, Axx - Ayy)
+    # Average orientation over ROI using complex representation
+    ori_roi = orientation_field[mask]
+    mean_vec = np.exp(1j * 2.0 * ori_roi).mean()
+    orientation = 0.5 * np.angle(mean_vec)
+    return orientation
+
+
+def skeletonize_lines(binary: np.ndarray) -> np.ndarray:
+    """
+    Skeletonize binary line mask to 1-pixel-wide centerlines.
+
+    Parameters
+    ----------
+    binary : np.ndarray of bool
+        Segmented lines.
+
+    Returns
+    -------
+    skeleton : np.ndarray of bool
+        1-pixel-wide skeleton of lines.
+    """
+    skeleton = skeletonize(binary)
+    return skeleton
+
+
+# ---------------------------------------------------------------------------
+# Cut metric (per-line gaps)
+# ---------------------------------------------------------------------------
+
+def _largest_gap_along_pca_axis(coords: np.ndarray) -> float:
+    """
+    Compute largest gap along main PCA axis of a set of coordinates.
+
+    Parameters
+    ----------
+    coords : np.ndarray, shape (N, 2)
+        (y, x) coordinates of skeleton pixels for a single line.
+
+    Returns
+    -------
+    max_gap_pixels : float
+        Largest gap between consecutive projected points (in pixels).
+    """
+    if coords.shape[0] < 3:
+        return 0.0
+
+    # PCA on (y, x)
+    mean = coords.mean(axis=0)
+    centered = coords - mean
+    cov = np.cov(centered.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    main_axis = eigvecs[:, np.argmax(eigvals)]  # shape (2,)
+
+    # Project coordinates onto main axis
+    t = centered @ main_axis  # shape (N,)
+    t_sorted = np.sort(t)
+    diffs = np.diff(t_sorted)
+
+    # In an ideal skeleton, step ~= 1 pixel; larger gaps indicate potential cuts.
+    max_gap = float(np.max(diffs)) if diffs.size > 0 else 0.0
+    return max_gap
+
+
+def compute_cut_metrics(
+    skeleton: np.ndarray,
+) -> CutMetrics:
+    """
+    Compute per-line and global "cut" metrics.
+
+    Parameters
+    ----------
+    skeleton : np.ndarray of bool
+        Skeletonized lines.
+
+    Returns
+    -------
+    CutMetrics
+        Per-line max gap and global max gap, all in pixels.
+    """
+    labels = label(skeleton, connectivity=2)
+    props = regionprops(labels)
+
+    per_line_gaps: Dict[int, float] = {}
+    for region in props:
+        line_label = region.label
+        coords = region.coords  # (N, 2) with (row=y, col=x)
+        max_gap = _largest_gap_along_pca_axis(coords.astype(float))
+        per_line_gaps[line_label] = max_gap
+
+    global_max = max(per_line_gaps.values()) if per_line_gaps else 0.0
+    return CutMetrics(
+        per_line_max_gap_pixels=per_line_gaps,
+        global_max_gap_pixels=global_max,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bridge metric (distance between lines)
+# ---------------------------------------------------------------------------
+
+def _build_line_kdtrees(
+    labels: np.ndarray,
+) -> Dict[int, cKDTree]:
+    """
+    Build KD-Tree per labeled line.
+
+    Parameters
+    ----------
+    labels : np.ndarray of int
+        Labeled skeleton (0 = background).
+
+    Returns
+    -------
+    trees : dict
+        Mapping label -> cKDTree built on that line's (y, x) coords.
+    """
+    trees: Dict[int, cKDTree] = {}
+    label_ids = np.unique(labels)
+    label_ids = label_ids[label_ids != 0]
+
+    for lbl in label_ids:
+        coords = np.column_stack(np.nonzero(labels == lbl)).astype(float)
+        if coords.shape[0] == 0:
+            continue
+        trees[lbl] = cKDTree(coords)
+    return trees
+
+
+def _find_closest_line_pair(
+    labels: np.ndarray,
+) -> Tuple[Tuple[int, int], Tuple[float, float], Tuple[float, float], float]:
+    """
+    Find the closest pair of lines (in centerline space).
+
+    Parameters
+    ----------
+    labels : np.ndarray of int
+        Labeled skeleton.
+
+    Returns
+    -------
+    (label1, label2) : tuple of int
+    (y1, x1) : point on line1
+    (y2, x2) : point on line2
+    min_dist : float
+        Minimum centerline-to-centerline distance (in pixels).
+    """
+    trees = _build_line_kdtrees(labels)
+    line_ids = sorted(trees.keys())
+
+    if len(line_ids) < 2:
+        raise ValueError("Need at least two lines to define a bridge metric.")
+
+    best_pair = (line_ids[0], line_ids[1])
+    best_p1 = (0.0, 0.0)
+    best_p2 = (0.0, 0.0)
+    best_dist = np.inf
+
+    for i, lbl1 in enumerate(line_ids):
+        tree1 = trees[lbl1]
+        coords1 = tree1.data  # (N1, 2)
+        for lbl2 in line_ids[i + 1 :]:
+            tree2 = trees[lbl2]
+            coords2 = tree2.data  # (N2, 2)
+
+            # Query distances from each point in coords1 to line2
+            d12, idx2 = tree2.query(coords1, k=1)
+            min_idx_1 = int(np.argmin(d12))
+            dist_12 = float(d12[min_idx_1])
+            if dist_12 < best_dist:
+                best_dist = dist_12
+                best_pair = (lbl1, lbl2)
+                p1 = coords1[min_idx_1]
+                p2 = coords2[idx2[min_idx_1]]
+                best_p1 = (float(p1[0]), float(p1[1]))
+                best_p2 = (float(p2[0]), float(p2[1]))
+
+            # Also check from coords2 to line1 (for symmetry)
+            d21, idx1 = tree1.query(coords2, k=1)
+            min_idx_2 = int(np.argmin(d21))
+            dist_21 = float(d21[min_idx_2])
+            if dist_21 < best_dist:
+                best_dist = dist_21
+                best_pair = (lbl1, lbl2)
+                p2 = coords2[min_idx_2]
+                p1 = coords1[idx1[min_idx_2]]
+                best_p1 = (float(p1[0]), float(p1[1]))
+                best_p2 = (float(p2[0]), float(p2[1]))
+
+    return best_pair, best_p1, best_p2, best_dist
+
+
+# ---------------------------------------------------------------------------
+# Cross-section profile & sub-pixel edges
+# ---------------------------------------------------------------------------
+
+def sample_profile_between_points(
+    image: np.ndarray,
+    p1: Tuple[float, float],
+    p2: Tuple[float, float],
+    n_samples: int = 256,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Sample a 1D intensity profile along the segment [p1, p2].
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Input image (normalized or original).
+    p1, p2 : (y, x)
+        Endpoints of segment.
+    n_samples : int
+        Number of samples along the line.
+
+    Returns
+    -------
+    distances : np.ndarray
+        Distance of each sample from p1 (in pixels).
+    profile : np.ndarray
+        Intensity values along the segment.
+    """
+    y1, x1 = p1
+    y2, x2 = p2
+
+    ys = np.linspace(y1, y2, n_samples)
+    xs = np.linspace(x1, x2, n_samples)
+    coords = np.vstack([ys, xs])  # shape (2, n_samples)
+
+    profile = map_coordinates(image, coords, order=1, mode="reflect")
+
+    length = float(np.hypot(y2 - y1, x2 - x1))
+    if n_samples > 1:
+        distances = np.linspace(0.0, length, n_samples)
+    else:
+        distances = np.array([0.0], dtype=float)
+    return distances, profile
+
+
+def _subpixel_peak_position(
+    arr: np.ndarray,
+    idx: int,
+) -> float:
+    """
+    Quadratic interpolation around index 'idx' to get sub-pixel peak location.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        1D array (e.g., gradient or |gradient|).
+    idx : int
+        Index of maximum (or minimum) in arr.
+
+    Returns
+    -------
+    pos : float
+        Sub-pixel peak position (same coordinate system as idx).
+    """
+    n = len(arr)
+    if idx <= 0 or idx >= n - 1:
+        return float(idx)
+
+    y0, y1, y2 = arr[idx - 1], arr[idx], arr[idx + 1]
+    denom = 2.0 * (y0 - 2.0 * y1 + y2)
+    if denom == 0.0:
+        return float(idx)
+
+    delta = (y0 - y2) / denom
+    return float(idx + delta)
+
+
+def estimate_edge_gap_from_profile(
+    distances: np.ndarray,
+    profile: np.ndarray,
+) -> Optional[float]:
+    """
+    Estimate edge-to-edge gap between two bright lines from a 1D profile.
+
+    Assumes:
+        - Bright lines on darker background.
+        - Two lines with a (possibly shallow) valley between them.
+
+    Heuristic:
+        1. Find index of valley (minimum intensity).
+        2. On left side, find most negative gradient -> falling edge of left line.
+        3. On right side, find most positive gradient -> rising edge of right line.
+        4. Refine both edge positions using quadratic interpolation on the gradient.
+        5. Convert index difference to distance using 'distances'.
+
+    Parameters
+    ----------
+    distances : np.ndarray
+        Distance from p1 for each profile sample.
+    profile : np.ndarray
+        Intensity profile along [p1, p2].
+
+    Returns
+    -------
+    gap_pixels : float or None
+        Estimated edge-to-edge gap in pixels, or None if estimation fails.
+    """
+    if profile.size < 5:
+        return None
+
+    grad = np.gradient(profile)
+    n = profile.size
+
+    # Step 1: valley between lines
+    valley_idx = int(np.argmin(profile))
+    if valley_idx <= 1 or valley_idx >= n - 2:
+        # Valley is too close to boundary -> unreliable
+        return None
+
+    # Step 2: left side - look for most negative gradient (falling edge)
+    left_grad = grad[:valley_idx]
+    if left_grad.size < 3:
+        return None
+    idx_left = int(np.argmin(left_grad))  # most negative
+    pos_left = _subpixel_peak_position(-grad, idx_left)  # maximize |grad|
+
+    # Step 3: right side - look for most positive gradient (rising edge)
+    right_grad = grad[valley_idx:]
+    if right_grad.size < 3:
+        return None
+    idx_right_rel = int(np.argmax(right_grad))
+    idx_right = valley_idx + idx_right_rel
+    pos_right = _subpixel_peak_position(grad, idx_right)
+
+    # Map sub-pixel indices to distances via linear interpolation
+    def idx_to_dist(pos: float) -> float:
+        # pos in [0, n-1]
+        if pos <= 0.0:
+            return float(distances[0])
+        if pos >= n - 1:
+            return float(distances[-1])
+        i0 = int(np.floor(pos))
+        i1 = i0 + 1
+        t = pos - i0
+        return float((1.0 - t) * distances[i0] + t * distances[i1])
+
+    d_left = idx_to_dist(pos_left)
+    d_right = idx_to_dist(pos_right)
+    gap = abs(d_right - d_left)
+    return gap
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
+def analyze_line_space_in_ellipse(
+    image: np.ndarray,
+    roi: EllipseROI,
+    debug: bool = True,
+    debug_save_dir: Optional[str] = None,
+) -> LineSpaceAnalysisResult:
+    """
+    Full pipeline to analyze line-space pattern inside an ellipse ROI.
+
+    Parameters
+    ----------
+    image : np.ndarray
+    roi : EllipseROI
+        Elliptical ROI parameters.
+    debug : bool
+        If True, produce debug plots after key steps.
+    debug_save_dir : str or None
+        Directory where plots are saved. If None, plots are shown interactively.
+
+    Returns
+    -------
+    LineSpaceAnalysisResult
+        Cut and bridge metrics plus intermediate masks.
+    """
+    dbg = DebugVisualizer(enabled=debug, save_dir=debug_save_dir)
+
+    if image.ndim != 2:
+        raise ValueError("Input image must be 2D (grayscale).")
+
+    h, w = image.shape
+
+    # 1) ROI mask
+    mask = create_ellipse_mask((h, w), roi)
+    dbg.show_image(image, "01_Original_with_ROI", overlay=np.where(mask, 1.0, np.nan))
+
+    # 2) Normalize inside ROI
+    image_norm = normalize_in_roi(image, mask)
+    dbg.show_image(image_norm, "02_Normalized_within_ROI")
+
+    # 3) Ridge enhancement (bright lines)
+    ridge = enhance_ridges(image_norm, mask)
+    dbg.show_image(ridge, "03_Ridge_Response_Sato")
+
+    # 4) Segmentation via Otsu
+    binary = segment_lines_otsu(ridge, mask)
+    dbg.show_image(binary.astype(float), "04_Binary_Lines_Segmentation")
+
+    # 5) Skeletonization
+    skeleton = skeletonize_lines(binary)
+    dbg.show_image(skeleton.astype(float), "05_Skeletonized_Lines")
+
+    # 6) Orientation (for reference / debugging)
+    orientation_rad = estimate_global_orientation(image_norm, mask)
+    # Optional: orientation overlay (e.g., draw a line)
+
+// Removed plots in code context, but you can add an overlay if needed
+
+    # 7) Cut metrics
+    cut_metrics = compute_cut_metrics(skeleton)
+
+    # 8) Bridge metrics (centerline distance)
+    labels_skel = label(skeleton, connectivity=2)
+    (lbl1, lbl2), p1, p2, min_dist = _find_closest_line_pair(labels_skel)
+
+    # Draw closest pair on debug image
+    overlay_closest = np.zeros_like(image_norm, dtype=float)
+    y1, x1 = int(round(p1[0])), int(round(p1[1]))
+    y2, x2 = int(round(p2[0])), int(round(p2[1]))
+    if 0 <= y1 < h and 0 <= x1 < w:
+        overlay_closest[y1, x1] = 1.0
+    if 0 <= y2 < h and 0 <= x2 < w:
+        overlay_closest[y2, x2] = 1.0
+    dbg.show_image(
+        image_norm,
+        f"06_Closest_Line_Pair_lbl{lbl1}_lbl{lbl2}",
+        overlay=np.where(overlay_closest > 0, overlay_closest, np.nan),
+    )
+
+    # 9) Cross-section profile & edge gap (optional)
+    # Use normalized image for profile; you can replace this with ALM later.
+    distances, profile = sample_profile_between_points(image_norm, p1, p2)
+    edge_gap = estimate_edge_gap_from_profile(distances, profile)
+
+    # Debug plot: profile
+    if debug:
+        fig, ax = plt.subplots(figsize=(6, 4), dpi=dbg.dpi)
+        ax.plot(distances, profile, label="Intensity")
+        ax.set_xlabel("Distance [pixels]")
+        ax.set_ylabel("Normalized GL")
+        ax.set_title("07_Cross_Section_Profile")
+        ax.grid(True)
+        fig.tight_layout()
+        if dbg.save_dir is not None:
+            from pathlib import Path
+            out_path = Path(dbg.save_dir) / "07_Cross_Section_Profile.png"
+            fig.savefig(out_path)
+            plt.close(fig)
+        else:
+            plt.show()
+
+    bridge_metrics = BridgeMetrics(
+        min_centerline_distance_pixels=min_dist,
+        label_pair=(lbl1, lbl2),
+        point_on_line1=p1,
+        point_on_line2=p2,
+        edge_gap_pixels=edge_gap,
+    )
+
+    return LineSpaceAnalysisResult(
+        cut_metrics=cut_metrics,
+        bridge_metrics=bridge_metrics,
+        binary_mask=binary,
+        skeleton=skeleton,
+        labels=labels_skel,
+        orientation_rad=orientation_rad,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Example usage (remove or adapt in your codebase)
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import os
+
+    # Example: random image (replace with your image)
+    H, W = 512, 512
+    dummy_image = (np.random.rand(H, W) * 65535).astype(np.uint16)
+
+    # Example ellipse in the center
+    roi = EllipseROI(
+        cy=H / 2,
+        cx=W / 2,
+        ry=H / 3,
+        rx=W / 3,
+        theta_rad=0.0,
+    )
+
+    out_dir = "debug_line_space"
+    os.makedirs(out_dir, exist_ok=True)
+
+    result = analyze_line_space_in_ellipse(
+        dummy_image,
+        roi,
+        debug=True,
+        debug_save_dir=out_dir,
+    )
+
+    print("Global cut metric (pixels):", result.cut_metrics.global_max_gap_pixels)
+    print("Per-line cut metrics:", result.cut_metrics.per_line_max_gap_pixels)
+    print("Bridge centerline distance (pixels):",
+          result.bridge_metrics.min_centerline_distance_pixels)
+    print("Edge gap estimate (pixels):", result.bridge_metrics.edge_gap_pixels)
