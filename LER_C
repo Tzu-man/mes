@@ -1,0 +1,263 @@
+import numpy as np
+from scipy import ndimage
+from scipy.signal import find_peaks
+from skimage import filters, morphology, measure
+from sklearn.mixture import GaussianMixture
+import cv2
+
+
+class SEMLineAnalyzer:
+    def __init__(self, image, ellipse):
+        """
+        Parameters:
+        -----------
+        image : ndarray
+            Grayscale 16-bit SEM image
+        ellipse : tuple
+            ((center_x, center_y), (width, height), angle) in OpenCV format
+        """
+        self.image = image.astype(np.float32)
+        self.ellipse = ellipse
+        self.segmented = None
+        self.edges_left = []
+        self.edges_right = []
+        self.ler_global = None
+        
+    def preprocess(self):
+        """Denoise and normalize image"""
+        # Bilateral filter: edge-preserving smoothing
+        img = cv2.bilateralFilter(self.image, d=5, sigmaColor=50, sigmaSpace=50)
+        
+        # Percentile-based normalization
+        p1, p99 = np.percentile(img, [1, 99])
+        img = np.clip((img - p1) / (p99 - p1), 0, 1)
+        
+        self.preprocessed = img
+        return img
+    
+    def segment_lines(self, n_components=4):
+        """Multi-level segmentation using GMM"""
+        img = self.preprocessed
+        
+        # Reshape for GMM
+        pixels = img.reshape(-1, 1)
+        
+        # Fit GMM
+        gmm = GaussianMixture(n_components=n_components, random_state=42)
+        labels = gmm.fit_predict(pixels)
+        segmented = labels.reshape(img.shape)
+        
+        # Identify line cluster (highest mean intensity)
+        means = [img[segmented == i].mean() for i in range(n_components)]
+        line_label = np.argmax(means)
+        
+        # Binary mask for lines
+        line_mask = (segmented == line_label).astype(np.uint8)
+        
+        # Morphological cleanup
+        kernel = np.ones((3, 3), np.uint8)
+        line_mask = cv2.morphologyEx(line_mask, cv2.MORPH_CLOSE, kernel)
+        line_mask = cv2.morphologyEx(line_mask, cv2.MORPH_OPEN, kernel)
+        
+        self.segmented = line_mask
+        return line_mask
+    
+    def detect_edges_subpixel(self):
+        """Detect line edges with sub-pixel accuracy"""
+        img = self.preprocessed
+        mask = self.segmented
+        
+        # Canny edge detection
+        edges = filters.canny(img, sigma=1.5)
+        edges = edges & (mask > 0)  # Keep only edges on lines
+        
+        # Find connected line regions
+        labeled = measure.label(mask)
+        regions = measure.regionprops(labeled)
+        
+        self.lines = []
+        
+        for region in regions:
+            if region.area < 50:  # Skip small regions
+                continue
+            
+            # Get bounding box
+            minr, minc, maxr, maxc = region.bbox
+            
+            # Extract edges for this line
+            line_edges = edges[minr:maxr, minc:maxc]
+            
+            # Find left and right edges by column scanning
+            left_edge = []
+            right_edge = []
+            
+            for col in range(line_edges.shape[1]):
+                edge_rows = np.where(line_edges[:, col])[0]
+                if len(edge_rows) >= 2:
+                    left_edge.append((minr + edge_rows[0], minc + col))
+                    right_edge.append((minr + edge_rows[-1], minc + col))
+            
+            if len(left_edge) > 10:  # Minimum points for valid line
+                self.lines.append({
+                    'left': np.array(left_edge),
+                    'right': np.array(right_edge),
+                    'bbox': (minr, minc, maxr, maxc)
+                })
+    
+    def calculate_ler(self):
+        """Calculate Line Edge Roughness (3σ)"""
+        all_left_deviations = []
+        all_right_deviations = []
+        
+        for line in self.lines:
+            # Fit polynomial reference lines (degree 2 for slight curvature)
+            left_pts = line['left']
+            right_pts = line['right']
+            
+            # Left edge LER
+            if len(left_pts) > 3:
+                poly_left = np.polyfit(left_pts[:, 1], left_pts[:, 0], deg=2)
+                ref_left = np.polyval(poly_left, left_pts[:, 1])
+                deviations_left = left_pts[:, 0] - ref_left
+                all_left_deviations.extend(deviations_left)
+            
+            # Right edge LER
+            if len(right_pts) > 3:
+                poly_right = np.polyfit(right_pts[:, 1], right_pts[:, 0], deg=2)
+                ref_right = np.polyval(poly_right, right_pts[:, 1])
+                deviations_right = right_pts[:, 0] - ref_right
+                all_right_deviations.extend(deviations_right)
+        
+        # Calculate 3σ LER
+        ler_left = 3 * np.std(all_left_deviations) if all_left_deviations else 0
+        ler_right = 3 * np.std(all_right_deviations) if all_right_deviations else 0
+        
+        self.ler_global = {
+            'left': ler_left,
+            'right': ler_right,
+            'mean': (ler_left + ler_right) / 2
+        }
+        
+        return self.ler_global
+    
+    def analyze_ellipse_region(self):
+        """Measure CD in ellipse and compare to global LER"""
+        # Create ellipse mask
+        mask = np.zeros(self.image.shape, dtype=np.uint8)
+        cv2.ellipse(mask, self.ellipse, 1, -1)
+        
+        # Find lines in ellipse
+        local_cds = []
+        
+        for line in self.lines:
+            left_pts = line['left']
+            right_pts = line['right']
+            
+            # Filter points inside ellipse
+            left_in_ellipse = [pt for pt in left_pts if mask[int(pt[0]), int(pt[1])] > 0]
+            right_in_ellipse = [pt for pt in right_pts if mask[int(pt[0]), int(pt[1])] > 0]
+            
+            if len(left_in_ellipse) < 5 or len(right_in_ellipse) < 5:
+                continue
+            
+            left_in_ellipse = np.array(left_in_ellipse)
+            right_in_ellipse = np.array(right_in_ellipse)
+            
+            # Measure CD at each position
+            for left_pt in left_in_ellipse:
+                # Find nearest right edge point
+                distances = np.linalg.norm(right_in_ellipse - left_pt, axis=1)
+                if len(distances) > 0:
+                    cd = np.min(distances)
+                    local_cds.append(cd)
+        
+        if len(local_cds) < 3:
+            return {
+                'local_cd_mean': 0,
+                'local_cd_std': 0,
+                'normalized_deviation': 0,
+                'interpretation': 'Insufficient data in ellipse'
+            }
+        
+        # Calculate local statistics
+        local_cd_mean = np.mean(local_cds)
+        local_cd_std = np.std(local_cds)
+        
+        # Expected variation from LER
+        expected_variation = np.sqrt(
+            self.ler_global['left']**2 + self.ler_global['right']**2
+        )
+        
+        # Normalized deviation
+        if expected_variation > 0:
+            normalized_dev = (local_cd_std - expected_variation) / expected_variation
+        else:
+            normalized_dev = 0
+        
+        # Interpretation
+        if normalized_dev > 0.2:
+            interp = "Significantly more variation than expected - possible defect"
+        elif normalized_dev < -0.2:
+            interp = "Less variation than expected - unusually uniform"
+        else:
+            interp = "Consistent with global LER"
+        
+        return {
+            'local_cd_mean': local_cd_mean,
+            'local_cd_std': local_cd_std,
+            'expected_variation': expected_variation,
+            'normalized_deviation': normalized_dev,
+            'interpretation': interp
+        }
+    
+    def run_full_analysis(self):
+        """Execute complete analysis pipeline"""
+        print("1. Preprocessing...")
+        self.preprocess()
+        
+        print("2. Segmenting lines...")
+        self.segment_lines()
+        
+        print("3. Detecting edges...")
+        self.detect_edges_subpixel()
+        
+        print("4. Calculating global LER...")
+        ler_results = self.calculate_ler()
+        
+        print("5. Analyzing ellipse region...")
+        ellipse_results = self.analyze_ellipse_region()
+        
+        results = {
+            'global_ler': ler_results,
+            'ellipse_analysis': ellipse_results,
+            'num_lines_detected': len(self.lines)
+        }
+        
+        return results
+
+
+# Example usage
+if __name__ == "__main__":
+    # Load 16-bit SEM image
+    image = cv2.imread('sem_image.tif', cv2.IMREAD_UNCHANGED)
+    
+    # Define ellipse: ((center_x, center_y), (width, height), angle)
+    ellipse = ((512, 512), (200, 100), 0)
+    
+    # Run analysis
+    analyzer = SEMLineAnalyzer(image, ellipse)
+    results = analyzer.run_full_analysis()
+    
+    # Print results
+    print("\n=== Results ===")
+    print(f"Lines detected: {results['num_lines_detected']}")
+    print(f"\nGlobal LER:")
+    print(f"  Left edge: {results['global_ler']['left']:.3f} pixels")
+    print(f"  Right edge: {results['global_ler']['right']:.3f} pixels")
+    print(f"  Mean: {results['global_ler']['mean']:.3f} pixels")
+    print(f"\nEllipse region analysis:")
+    print(f"  Mean CD: {results['ellipse_analysis']['local_cd_mean']:.3f} pixels")
+    print(f"  CD std dev: {results['ellipse_analysis']['local_cd_std']:.3f} pixels")
+    print(f"  Expected variation (from LER): {results['ellipse_analysis']['expected_variation']:.3f} pixels")
+    print(f"  Normalized deviation: {results['ellipse_analysis']['normalized_deviation']:.3f}")
+    print(f"  Interpretation: {results['ellipse_analysis']['interpretation']}")
