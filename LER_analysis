@@ -1,0 +1,1059 @@
+"""
+Line Edge Roughness & Edge-Anomaly Toolkit
+=========================================
+
+Professional interactive UI for:
+
+- Loading SEM image
+- Selecting line orientation (horizontal / vertical)
+- Detecting edges with several refinement options
+- Computing LER/LWR and spectral statistics
+- Visualizing residuals, PSD, correlation function, σ(L), heatmaps
+- Exporting CSV / Parquet with per-edge and per-sample metrics
+
+Run with:
+    streamlit run ler_ui_app.py
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, List, Tuple, Optional
+
+import cv2
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import streamlit as st
+from scipy.signal import find_peaks
+from scipy import stats
+
+# -------------------------------------------------------------------------
+# Logging configuration
+# -------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("ler_ui")
+
+
+# -------------------------------------------------------------------------
+# Core data structures
+# -------------------------------------------------------------------------
+
+class LineOrientation(str, Enum):
+    VERTICAL = "Vertical lines (edges mostly vertical)"
+    HORIZONTAL = "Horizontal lines (edges mostly horizontal)"
+
+
+class EdgeRefinementMode(str, Enum):
+    THRESHOLD_50 = "Local 1D profile, 50% threshold + linear interpolation"
+    # Placeholder for more advanced modes you may add later
+    # ERF_FIT = "Local 1D profile, error-function fit (non-linear)"
+
+
+@dataclass
+class EdgeDetectionConfig:
+    number_of_edges: int
+    minimum_edge_spacing_px: int
+    half_profile_width_px: int
+    percentile_low: float = 20.0
+    percentile_high: float = 80.0
+
+
+@dataclass
+class EdgeTrace:
+    edge_id: int
+    u: np.ndarray  # coordinate along the line (pixels)
+    v: np.ndarray  # coordinate across the line (sub-pixel, pixels)
+    orientation: LineOrientation
+
+
+@dataclass
+class LineWidthTrace:
+    line_id: int
+    u: np.ndarray
+    width_px: np.ndarray
+    left_edge_id: int
+    right_edge_id: int
+
+
+@dataclass
+class EdgeMetrics:
+    edge_id: int
+    sigma_ler_px: float
+    ler_3sigma_px: float
+    sigma_ler_nm: float
+    ler_3sigma_nm: float
+    lc_nm: Optional[float]
+
+
+@dataclass
+class EdgeAnalysisResult:
+    edges: List[EdgeTrace]
+    widths: List[LineWidthTrace]
+    residuals_px: Dict[int, np.ndarray]
+    ref_lines_px: Dict[int, np.ndarray]
+    edge_metrics: List[EdgeMetrics]
+    anomaly_scores: Dict[int, np.ndarray]
+    # For PSD / correlation / sigma(L) we store per-edge results
+    psd_freqs_nm_inv: Dict[int, np.ndarray]
+    psd_values: Dict[int, np.ndarray]
+    corr_tau_nm: Dict[int, np.ndarray]
+    corr_values: Dict[int, np.ndarray]
+    sigmaL_L_nm: Dict[int, np.ndarray]
+    sigmaL_values_nm: Dict[int, np.ndarray]
+
+
+# -------------------------------------------------------------------------
+# Utility functions
+# -------------------------------------------------------------------------
+
+def load_image_to_gray(image_bytes: bytes) -> np.ndarray:
+    """Decode an image file into a float32 grayscale array in [0, 1]."""
+    file_array = np.asarray(bytearray(image_bytes), dtype=np.uint8)
+    bgr = cv2.imdecode(file_array, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise ValueError("Failed to decode image.")
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    gray_f = gray.astype(np.float32)
+    gray_f = (gray_f - gray_f.min()) / max(1.0, (gray_f.max() - gray_f.min()))
+    logger.info("Loaded image with shape %s", gray_f.shape)
+    return gray_f
+
+
+def crop_image_numeric(
+    gray: np.ndarray,
+    crop_top: int,
+    crop_bottom: int,
+    crop_left: int,
+    crop_right: int,
+) -> np.ndarray:
+    """Crop an image using numeric margins from each side (in pixels)."""
+    h, w = gray.shape
+    top = max(0, crop_top)
+    left = max(0, crop_left)
+    bottom = max(0, h - crop_bottom)
+    right = max(0, w - crop_right)
+    roi = gray[top:bottom, left:right]
+    logger.info("Cropped ROI shape: %s", roi.shape)
+    return roi
+
+
+# -------------------------------------------------------------------------
+# Edge detection
+# -------------------------------------------------------------------------
+
+def _estimate_edge_positions_across_profile_vertical(
+    roi: np.ndarray, cfg: EdgeDetectionConfig
+) -> List[int]:
+    """
+    For vertical lines: average along rows to obtain a 1D profile across columns,
+    then detect strong gradient peaks as approximate edge locations.
+    """
+    profile = roi.mean(axis=0)  # shape (W,)
+    grad = np.gradient(profile)
+    grad_abs = np.abs(grad)
+
+    # Rough threshold: use top-N peaks, enforcing a minimum spacing
+    candidate_indices = np.argsort(grad_abs)[::-1]  # descending by gradient magnitude
+    selected: List[int] = []
+
+    for idx in candidate_indices:
+        if len(selected) >= cfg.number_of_edges:
+            break
+        if all(abs(idx - s) >= cfg.minimum_edge_spacing_px for s in selected):
+            selected.append(int(idx))
+
+    selected.sort()
+    logger.info("Estimated vertical edge x-positions: %s", selected)
+    return selected
+
+
+def _estimate_edge_positions_across_profile_horizontal(
+    roi: np.ndarray, cfg: EdgeDetectionConfig
+) -> List[int]:
+    """
+    For horizontal lines: average along columns to obtain a 1D profile across rows,
+    then detect strong gradient peaks as approximate edge locations.
+    """
+    profile = roi.mean(axis=1)  # shape (H,)
+    grad = np.gradient(profile)
+    grad_abs = np.abs(grad)
+
+    candidate_indices = np.argsort(grad_abs)[::-1]
+    selected: List[int] = []
+
+    for idx in candidate_indices:
+        if len(selected) >= cfg.number_of_edges:
+            break
+        if all(abs(idx - s) >= cfg.minimum_edge_spacing_px for s in selected):
+            selected.append(int(idx))
+
+    selected.sort()
+    logger.info("Estimated horizontal edge y-positions: %s", selected)
+    return selected
+
+
+def _refine_edge_position_1d_profile(
+    profile: np.ndarray,
+    coord_axis: np.ndarray,
+    cfg: EdgeDetectionConfig,
+) -> float:
+    """
+    Refine edge position along a 1D intensity profile using 50% threshold and
+    linear interpolation between closest sign change.
+
+    profile: intensity values along v
+    coord_axis: corresponding coordinate values (pixels) along v
+    """
+    if profile.size < 3:
+        # Not enough data for refinement
+        return float(coord_axis[profile.size // 2])
+
+    # Robust estimate of "dark" and "bright" levels using percentiles
+    dark_level = np.percentile(profile, cfg.percentile_low)
+    bright_level = np.percentile(profile, cfg.percentile_high)
+
+    threshold = 0.5 * (dark_level + bright_level)
+
+    # Sign of profile relative to threshold
+    diff = profile - threshold
+    signs = np.sign(diff)
+
+    # Look for first sign change with maximal local gradient
+    grad = np.gradient(profile)
+    candidate_indices, _ = find_peaks(np.abs(grad))
+    # Fallback: if find_peaks fails, just scan through
+    if candidate_indices.size == 0:
+        candidate_indices = np.arange(1, profile.size)
+
+    # Prioritize positions near the center of the profile
+    center_index = profile.size // 2
+    candidate_indices = candidate_indices[
+        np.argsort(np.abs(candidate_indices - center_index))
+    ]
+
+    for i in candidate_indices:
+        # Make sure we have i-1 and i in range
+        if i <= 0 or i >= profile.size:
+            continue
+
+        if signs[i - 1] == 0:
+            return float(coord_axis[i - 1])
+        if signs[i] == 0:
+            return float(coord_axis[i])
+
+        if signs[i - 1] != signs[i]:
+            # Linear interpolation between (i-1) and i
+            x0, x1 = coord_axis[i - 1], coord_axis[i]
+            y0, y1 = profile[i - 1], profile[i]
+            if y1 == y0:
+                return float(x0)
+            frac = (threshold - y0) / (y1 - y0)
+            x_edge = x0 + frac * (x1 - x0)
+            return float(x_edge)
+
+    # Fallback: center of profile
+    return float(coord_axis[center_index])
+
+
+def detect_edges(
+    roi: np.ndarray,
+    orientation: LineOrientation,
+    cfg: EdgeDetectionConfig,
+    refinement_mode: EdgeRefinementMode,
+) -> List[EdgeTrace]:
+    """
+    High-level edge detection routine.
+
+    Steps:
+    - Estimate approximate edge positions using 1D average profile.
+    - For each approximate edge and each line coordinate u, refine edge position
+      using the selected refinement mode (currently 50% threshold).
+    """
+    h, w = roi.shape
+
+    if orientation == LineOrientation.VERTICAL:
+        approx_positions = _estimate_edge_positions_across_profile_vertical(roi, cfg)
+        u_axis = np.arange(h, dtype=np.float32)
+        edges: List[EdgeTrace] = []
+
+        for edge_idx, x0 in enumerate(approx_positions, start=1):
+            v_coords = np.zeros_like(u_axis, dtype=np.float32)
+
+            # Define local window around x0
+            x_start = max(0, x0 - cfg.half_profile_width_px)
+            x_end = min(w - 1, x0 + cfg.half_profile_width_px)
+            v_axis = np.arange(x_start, x_end + 1, dtype=np.float32)
+
+            for row in range(h):
+                profile = roi[row, x_start : x_end + 1]
+                v_coords[row] = _refine_edge_position_1d_profile(
+                    profile, v_axis, cfg
+                )
+
+            edges.append(
+                EdgeTrace(
+                    edge_id=edge_idx,
+                    u=u_axis.copy(),
+                    v=v_coords,
+                    orientation=orientation,
+                )
+            )
+
+    else:  # HORIZONTAL
+        approx_positions = _estimate_edge_positions_across_profile_horizontal(roi, cfg)
+        u_axis = np.arange(w, dtype=np.float32)
+        edges = []
+
+        for edge_idx, y0 in enumerate(approx_positions, start=1):
+            v_coords = np.zeros_like(u_axis, dtype=np.float32)
+
+            y_start = max(0, y0 - cfg.half_profile_width_px)
+            y_end = min(h - 1, y0 + cfg.half_profile_width_px)
+            v_axis = np.arange(y_start, y_end + 1, dtype=np.float32)
+
+            for col in range(w):
+                profile = roi[y_start : y_end + 1, col]
+                v_coords[col] = _refine_edge_position_1d_profile(
+                    profile, v_axis, cfg
+                )
+
+            edges.append(
+                EdgeTrace(
+                    edge_id=edge_idx,
+                    u=u_axis.copy(),
+                    v=v_coords,
+                    orientation=orientation,
+                )
+            )
+
+    logger.info("Detected %d edges", len(edges))
+    return edges
+
+
+# -------------------------------------------------------------------------
+# Edge analysis / LER computation
+# -------------------------------------------------------------------------
+
+def compute_reference_line_and_residual(edge: EdgeTrace) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Fit a straight line v_ref(u) = a*u + b and compute residuals Δx = v - v_ref.
+    """
+    u = edge.u.astype(np.float64)
+    v = edge.v.astype(np.float64)
+    coeffs = np.polyfit(u, v, deg=1)
+    v_ref = np.polyval(coeffs, u)
+    residual = v - v_ref
+    return v_ref.astype(np.float32), residual.astype(np.float32)
+
+
+def compute_ler_metrics(
+    residual_px: np.ndarray,
+    nm_per_pixel: float,
+    u_step_nm: float,
+) -> Tuple[float, float, float, float, Optional[float]]:
+    """
+    Compute sigma_LER and LER (3σ) in both pixels and nm.
+    Also estimate correlation length L_c (nm) from correlation function.
+    """
+    sigma_px = float(np.std(residual_px, ddof=1))
+    sigma_nm = sigma_px * nm_per_pixel
+    ler_3sigma_px = 3.0 * sigma_px
+    ler_3sigma_nm = 3.0 * sigma_nm
+
+    # Correlation-based estimate of L_c
+    tau_nm, corr_vals = compute_correlation_function(residual_px, u_step_nm)
+    # L_c ~ lag where correlation decays to 1/e
+    idx = np.where(corr_vals <= 1.0 / np.e)[0]
+    lc_nm: Optional[float]
+    if idx.size > 0:
+        lc_nm = float(tau_nm[idx[0]])
+    else:
+        lc_nm = None
+
+    return sigma_px, ler_3sigma_px, sigma_nm, ler_3sigma_nm, lc_nm
+
+
+def compute_psd(residual_px: np.ndarray, u_step_nm: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute one-sided power spectral density (PSD) of residual along the edge.
+    """
+    r = residual_px.astype(np.float64)
+    r = r - r.mean()
+    n = r.size
+    fft_vals = np.fft.rfft(r)
+    freqs = np.fft.rfftfreq(n, d=u_step_nm)  # cycles per nm
+    psd = (np.abs(fft_vals) ** 2) / (n * u_step_nm)
+    return freqs, psd
+
+
+def compute_correlation_function(
+    residual_px: np.ndarray,
+    u_step_nm: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute normalized autocorrelation function R(τ) for non-negative lags.
+    """
+    r = residual_px.astype(np.float64)
+    r = r - r.mean()
+    n = r.size
+
+    corr_full = np.correlate(r, r, mode="full")
+    mid = len(corr_full) // 2
+    corr = corr_full[mid:]  # non-negative lags
+    corr = corr / corr[0]  # normalize R(0) = 1
+
+    tau_steps = np.arange(corr.size, dtype=np.float64)
+    tau_nm = tau_steps * u_step_nm
+    return tau_nm, corr
+
+
+def compute_sigma_L_curve(
+    residual_px: np.ndarray,
+    u_step_nm: float,
+    num_points: int = 10,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute σ(L_box) vs L_box by sliding windows along the edge and averaging
+    standard deviations across windows.
+    """
+    r = residual_px.astype(np.float64)
+    n = r.size
+    if n < 8:
+        return np.array([n * u_step_nm]), np.array([np.std(r, ddof=1)])
+
+    window_sizes = np.unique(np.geomspace(4, n, num=num_points).astype(int))
+    L_nm_list: List[float] = []
+    sigma_list: List[float] = []
+
+    for win in window_sizes:
+        if win < 2:
+            continue
+        local_sigmas: List[float] = []
+        for start in range(0, n - win + 1):
+            seg = r[start : start + win]
+            local_sigmas.append(float(np.std(seg, ddof=1)))
+        if local_sigmas:
+            L_nm_list.append(win * u_step_nm)
+            sigma_list.append(float(np.mean(local_sigmas)))
+
+    return np.array(L_nm_list), np.array(sigma_list)
+
+
+def build_width_traces(edges: List[EdgeTrace]) -> List[LineWidthTrace]:
+    """
+    Pair neighboring edges by mean v-position to form line-width traces.
+    Assumes edges belong to line-space pattern and are roughly ordered.
+    """
+    if len(edges) < 2:
+        return []
+
+    sorted_edges = sorted(edges, key=lambda e: float(e.v.mean()))
+    width_traces: List[LineWidthTrace] = []
+
+    for i in range(0, len(sorted_edges) - 1, 2):
+        left = sorted_edges[i]
+        right = sorted_edges[i + 1]
+        if not np.array_equal(left.u, right.u):
+            logger.warning("Edges %d and %d have mismatched u-grids; skipping pairing",
+                           left.edge_id, right.edge_id)
+            continue
+
+        width_px = right.v - left.v
+        line_id = len(width_traces) + 1
+        width_traces.append(
+            LineWidthTrace(
+                line_id=line_id,
+                u=left.u.copy(),
+                width_px=width_px.astype(np.float32),
+                left_edge_id=left.edge_id,
+                right_edge_id=right.edge_id,
+            )
+        )
+
+    logger.info("Built %d line-width traces", len(width_traces))
+    return width_traces
+
+
+def compute_anomaly_scores(residual_px: np.ndarray) -> np.ndarray:
+    """
+    Simple anomaly score: |Δx| / σ_global.
+    More advanced models (local statistics, change-point tests) can be added later.
+    """
+    r = residual_px.astype(np.float64)
+    sigma = np.std(r, ddof=1) + 1e-9
+    scores = np.abs(r) / sigma
+    return scores.astype(np.float32)
+
+
+def analyze_edges(
+    edges: List[EdgeTrace],
+    nm_per_pixel: float,
+) -> EdgeAnalysisResult:
+    """
+    Run complete analysis on a list of EdgeTrace objects.
+    """
+    residuals_px: Dict[int, np.ndarray] = {}
+    ref_lines_px: Dict[int, np.ndarray] = {}
+    edge_metrics_list: List[EdgeMetrics] = []
+    anomaly_scores: Dict[int, np.ndarray] = {}
+    psd_freqs: Dict[int, np.ndarray] = {}
+    psd_values: Dict[int, np.ndarray] = {}
+    corr_tau: Dict[int, np.ndarray] = {}
+    corr_vals: Dict[int, np.ndarray] = {}
+    sigmaL_L: Dict[int, np.ndarray] = {}
+    sigmaL_vals: Dict[int, np.ndarray] = {}
+
+    # Assume pixel sampling along u is 1 pixel -> u_step_nm equals nm_per_pixel
+    u_step_nm = nm_per_pixel
+
+    for edge in edges:
+        v_ref, residual = compute_reference_line_and_residual(edge)
+        residuals_px[edge.edge_id] = residual
+        ref_lines_px[edge.edge_id] = v_ref
+
+        sigma_px, ler3_px, sigma_nm, ler3_nm, lc_nm = compute_ler_metrics(
+            residual, nm_per_pixel, u_step_nm
+        )
+
+        edge_metrics_list.append(
+            EdgeMetrics(
+                edge_id=edge.edge_id,
+                sigma_ler_px=sigma_px,
+                ler_3sigma_px=ler3_px,
+                sigma_ler_nm=sigma_nm,
+                ler_3sigma_nm=ler3_nm,
+                lc_nm=lc_nm,
+            )
+        )
+
+        anomaly_scores[edge.edge_id] = compute_anomaly_scores(residual)
+
+        freqs, psd = compute_psd(residual, u_step_nm)
+        psd_freqs[edge.edge_id] = freqs
+        psd_values[edge.edge_id] = psd
+
+        tau_nm, R = compute_correlation_function(residual, u_step_nm)
+        corr_tau[edge.edge_id] = tau_nm
+        corr_vals[edge.edge_id] = R
+
+        L_nm, sigmaL_nm = compute_sigma_L_curve(residual, u_step_nm)
+        sigmaL_L[edge.edge_id] = L_nm
+        sigmaL_vals[edge.edge_id] = sigmaL_nm
+
+    widths = build_width_traces(edges)
+
+    return EdgeAnalysisResult(
+        edges=edges,
+        widths=widths,
+        residuals_px=residuals_px,
+        ref_lines_px=ref_lines_px,
+        edge_metrics=edge_metrics_list,
+        anomaly_scores=anomaly_scores,
+        psd_freqs_nm_inv=psd_freqs,
+        psd_values=psd_values,
+        corr_tau_nm=corr_tau,
+        corr_values=corr_vals,
+        sigmaL_L_nm=sigmaL_L,
+        sigmaL_values_nm=sigmaL_vals,
+    )
+
+
+# -------------------------------------------------------------------------
+# Export helpers
+# -------------------------------------------------------------------------
+
+def build_sample_level_dataframe(
+    analysis: EdgeAnalysisResult,
+    nm_per_pixel: float,
+) -> pd.DataFrame:
+    """
+    Flatten per-edge traces into a sample-level table:
+
+    Columns:
+    - edge_id
+    - u_px, u_nm
+    - v_edge_px, v_edge_nm
+    - delta_x_px, delta_x_nm
+    - anomaly_score
+    - width_nm (if available; NaN otherwise)
+    """
+    width_per_edge: Dict[int, np.ndarray] = {}
+    for w_trace in analysis.widths:
+        width_nm = w_trace.width_px * nm_per_pixel
+        width_per_edge[w_trace.left_edge_id] = width_nm
+        width_per_edge[w_trace.right_edge_id] = width_nm
+
+    records: List[Dict[str, float]] = []
+
+    for edge in analysis.edges:
+        edge_id = edge.edge_id
+        u_px = edge.u.astype(np.float64)
+        v_edge_px = edge.v.astype(np.float64)
+        residual_px = analysis.residuals_px[edge_id].astype(np.float64)
+        anomaly = analysis.anomaly_scores[edge_id].astype(np.float64)
+
+        u_nm = u_px * nm_per_pixel
+        v_edge_nm = v_edge_px * nm_per_pixel
+        delta_x_nm = residual_px * nm_per_pixel
+        width_nm = width_per_edge.get(edge_id, np.full_like(u_nm, np.nan))
+
+        for i in range(u_px.size):
+            records.append(
+                dict(
+                    edge_id=edge_id,
+                    u_px=float(u_px[i]),
+                    u_nm=float(u_nm[i]),
+                    v_edge_px=float(v_edge_px[i]),
+                    v_edge_nm=float(v_edge_nm[i]),
+                    delta_x_px=float(residual_px[i]),
+                    delta_x_nm=float(delta_x_nm[i]),
+                    anomaly_score=float(anomaly[i]),
+                    width_nm=float(width_nm[i]),
+                )
+            )
+
+    df = pd.DataFrame.from_records(records)
+    return df
+
+
+def build_edge_summary_dataframe(analysis: EdgeAnalysisResult) -> pd.DataFrame:
+    """Per-edge summary table from EdgeMetrics."""
+    data = []
+    for m in analysis.edge_metrics:
+        data.append(
+            dict(
+                edge_id=m.edge_id,
+                sigma_ler_px=m.sigma_ler_px,
+                ler_3sigma_px=m.ler_3sigma_px,
+                sigma_ler_nm=m.sigma_ler_nm,
+                ler_3sigma_nm=m.ler_3sigma_nm,
+                lc_nm=m.lc_nm,
+            )
+        )
+    return pd.DataFrame(data)
+
+
+# -------------------------------------------------------------------------
+# Plotting helpers (for Streamlit)
+# -------------------------------------------------------------------------
+
+def plot_roi_with_edges(
+    roi: np.ndarray,
+    analysis: EdgeAnalysisResult,
+    nm_per_pixel: float,
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.imshow(roi, cmap="gray", origin="upper")
+    for edge in analysis.edges:
+        if edge.orientation == LineOrientation.VERTICAL:
+            x = edge.v
+            y = edge.u
+        else:
+            x = edge.u
+            y = edge.v
+        ax.plot(x, y, color="lime", linewidth=1.0, label=f"Edge {edge.edge_id}")
+    ax.set_title("ROI with detected edges")
+    ax.set_axis_off()
+    return fig
+
+
+def plot_residual_traces(
+    analysis: EdgeAnalysisResult,
+    nm_per_pixel: float,
+    max_edges: int = 3,
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(7, 4))
+    for edge in analysis.edges[:max_edges]:
+        u_nm = edge.u * nm_per_pixel
+        delta_nm = analysis.residuals_px[edge.edge_id] * nm_per_pixel
+        ax.plot(u_nm, delta_nm, label=f"Edge {edge.edge_id}")
+    ax.set_xlabel("Position along edge u [nm]")
+    ax.set_ylabel("Residual Δx [nm]")
+    ax.set_title("Residual vs position for selected edges")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    return fig
+
+
+def plot_hist_and_qq(
+    analysis: EdgeAnalysisResult,
+    nm_per_pixel: float,
+) -> plt.Figure:
+    # Pool residuals from all edges
+    residuals_all = np.concatenate(
+        [r for r in analysis.residuals_px.values()], axis=0
+    ).astype(np.float64)
+    residuals_nm = residuals_all * nm_per_pixel
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+    # Histogram
+    axes[0].hist(residuals_nm, bins=40, density=True, alpha=0.7)
+    axes[0].set_xlabel("Residual Δx [nm]")
+    axes[0].set_ylabel("Density")
+    axes[0].set_title("Histogram of residuals")
+
+    # Q-Q plot vs normal
+    stats.probplot(residuals_nm, dist="norm", plot=axes[1])
+    axes[1].set_title("Q–Q plot vs Normal")
+
+    fig.tight_layout()
+    return fig
+
+
+def plot_ler_summary(
+    analysis: EdgeAnalysisResult,
+) -> plt.Figure:
+    df = build_edge_summary_dataframe(analysis)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.bar(df["edge_id"].astype(str), df["ler_3sigma_nm"])
+    ax.set_xlabel("Edge ID")
+    ax.set_ylabel("LER (3σ) [nm]")
+    ax.set_title("Global LER per edge")
+    ax.grid(axis="y", alpha=0.3)
+    return fig
+
+
+def plot_width_vs_position(
+    analysis: EdgeAnalysisResult,
+    nm_per_pixel: float,
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(7, 4))
+    for w in analysis.widths:
+        u_nm = w.u * nm_per_pixel
+        width_nm = w.width_px * nm_per_pixel
+        ax.plot(u_nm, width_nm, label=f"Line {w.line_id}")
+    ax.set_xlabel("Position along line u [nm]")
+    ax.set_ylabel("Width [nm]")
+    ax.set_title("Width vs position")
+    ax.grid(True, alpha=0.3)
+    if analysis.widths:
+        ax.legend()
+    return fig
+
+
+def plot_psd(
+    analysis: EdgeAnalysisResult,
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(7, 4))
+    for edge in analysis.edges:
+        f = analysis.psd_freqs_nm_inv[edge.edge_id]
+        psd = analysis.psd_values[edge.edge_id]
+        ax.loglog(f[1:], psd[1:], label=f"Edge {edge.edge_id}")  # skip DC
+    ax.set_xlabel("Spatial frequency [1/nm]")
+    ax.set_ylabel("PSD [nm²·(1/nm)] (relative units)")
+    ax.set_title("Power spectral density of residuals")
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend()
+    return fig
+
+
+def plot_correlation(
+    analysis: EdgeAnalysisResult,
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(7, 4))
+    for edge in analysis.edges:
+        tau = analysis.corr_tau_nm[edge.edge_id]
+        R = analysis.corr_values[edge.edge_id]
+        ax.plot(tau, R, label=f"Edge {edge.edge_id}")
+    ax.set_xlabel("Lag τ [nm]")
+    ax.set_ylabel("R(τ)")
+    ax.set_title("Correlation function of residuals")
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(-0.2, 1.05)
+    ax.legend()
+    return fig
+
+
+def plot_sigma_L(
+    analysis: EdgeAnalysisResult,
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(7, 4))
+    for edge in analysis.edges:
+        L_nm = analysis.sigmaL_L_nm[edge.edge_id]
+        sigma_nm = analysis.sigmaL_values_nm[edge.edge_id]
+        ax.plot(L_nm, sigma_nm, marker="o", label=f"Edge {edge.edge_id}")
+    ax.set_xscale("log")
+    ax.set_xlabel("Measurement length L_box [nm]")
+    ax.set_ylabel("σ(L) [nm]")
+    ax.set_title("σ(L) curve")
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend()
+    return fig
+
+
+def plot_roughness_heatmap(
+    analysis: EdgeAnalysisResult,
+    nm_per_pixel: float,
+) -> plt.Figure:
+    # Build matrix: edges x u
+    edges_sorted = sorted(analysis.edges, key=lambda e: e.edge_id)
+    max_len = max(e.u.size for e in edges_sorted)
+    mat = np.full((len(edges_sorted), max_len), np.nan, dtype=np.float32)
+
+    for i, edge in enumerate(edges_sorted):
+        r = analysis.residuals_px[edge.edge_id]
+        mat[i, : r.size] = r
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    extent = [
+        0,
+        max_len * nm_per_pixel,
+        1,
+        len(edges_sorted) + 1,
+    ]  # x_min, x_max, y_min, y_max
+    im = ax.imshow(
+        mat,
+        aspect="auto",
+        interpolation="nearest",
+        cmap="RdBu_r",
+        origin="lower",
+        extent=extent,
+    )
+    ax.set_xlabel("Position along edge u [nm]")
+    ax.set_ylabel("Edge index")
+    ax.set_title("Roughness heatmap (Δx [pixels])")
+    fig.colorbar(im, ax=ax, label="Residual Δx [pixels]")
+    return fig
+
+
+def plot_anomaly_scores(
+    analysis: EdgeAnalysisResult,
+    nm_per_pixel: float,
+    max_edges: int = 3,
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(7, 4))
+    for edge in analysis.edges[:max_edges]:
+        u_nm = edge.u * nm_per_pixel
+        score = analysis.anomaly_scores[edge.edge_id]
+        ax.plot(u_nm, score, label=f"Edge {edge.edge_id}")
+    ax.set_xlabel("Position along edge u [nm]")
+    ax.set_ylabel("Anomaly score (|Δx| / σ)")
+    ax.set_title("Anomaly score vs position")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    return fig
+
+
+# -------------------------------------------------------------------------
+# Streamlit UI
+# -------------------------------------------------------------------------
+
+def main():
+    st.set_page_config(
+        page_title="LER & Edge Anomaly Toolkit",
+        layout="wide",
+    )
+    st.title("Line Edge Roughness & Edge-Anomaly Analysis")
+
+    st.sidebar.header("Input & Configuration")
+
+    uploaded_file = st.sidebar.file_uploader(
+        "Upload SEM image",
+        type=["png", "jpg", "jpeg", "tif", "tiff", "bmp"],
+    )
+
+    orientation_choice = st.sidebar.radio(
+        "Line orientation",
+        options=list(LineOrientation),
+        format_func=lambda o: o.value,
+    )
+
+    refinement_choice = st.sidebar.radio(
+        "Edge refinement method",
+        options=list(EdgeRefinementMode),
+        format_func=lambda m: m.value,
+    )
+
+    nm_per_pixel = st.sidebar.number_input(
+        "Scale (nm per pixel)",
+        min_value=0.01,
+        max_value=100.0,
+        value=1.0,
+        step=0.01,
+        help="Use the microscope calibration or scale bar.",
+    )
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("ROI cropping (pixels)")
+
+    crop_top = st.sidebar.number_input("Crop top", min_value=0, value=0)
+    crop_bottom = st.sidebar.number_input("Crop bottom", min_value=0, value=0)
+    crop_left = st.sidebar.number_input("Crop left", min_value=0, value=0)
+    crop_right = st.sidebar.number_input("Crop right", min_value=0, value=0)
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Edge detection parameters")
+
+    num_edges = st.sidebar.number_input(
+        "Number of edges to detect",
+        min_value=1,
+        max_value=50,
+        value=3,
+    )
+    min_spacing = st.sidebar.number_input(
+        "Minimum spacing between edges [px]",
+        min_value=2,
+        max_value=200,
+        value=20,
+    )
+    half_profile = st.sidebar.number_input(
+        "Half-width of local profile [px]",
+        min_value=2,
+        max_value=50,
+        value=6,
+    )
+
+    run_button = st.sidebar.button(
+        "Run analysis",
+        disabled=(uploaded_file is None),
+    )
+
+    if uploaded_file is None:
+        st.info("Upload an image to begin.")
+        return
+
+    # Load full image and ROI
+    gray = load_image_to_gray(uploaded_file.read())
+    st.subheader("Original image (grayscale)")
+    st.image(gray, clamp=True, channels="GRAY")
+
+    roi = crop_image_numeric(gray, crop_top, crop_bottom, crop_left, crop_right)
+    st.subheader("Region of interest (ROI)")
+    st.image(roi, clamp=True, channels="GRAY")
+
+    if not run_button:
+        st.stop()
+
+    # Edge detection
+    cfg = EdgeDetectionConfig(
+        number_of_edges=int(num_edges),
+        minimum_edge_spacing_px=int(min_spacing),
+        half_profile_width_px=int(half_profile),
+    )
+
+    with st.spinner("Detecting edges and computing LER metrics..."):
+        edges = detect_edges(
+            roi=roi,
+            orientation=orientation_choice,
+            cfg=cfg,
+            refinement_mode=refinement_choice,
+        )
+        analysis = analyze_edges(edges, nm_per_pixel=nm_per_pixel)
+
+    st.success("Analysis completed.")
+
+    # ---------------------------------------------------------------------
+    # Export tables
+    # ---------------------------------------------------------------------
+
+    sample_df = build_sample_level_dataframe(analysis, nm_per_pixel)
+    edge_summary_df = build_edge_summary_dataframe(analysis)
+
+    st.subheader("Per-edge summary")
+    st.dataframe(edge_summary_df, use_container_width=True)
+
+    st.subheader("Download results")
+
+    csv_bytes = sample_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download sample-level CSV",
+        data=csv_bytes,
+        file_name="edge_samples.csv",
+        mime="text/csv",
+    )
+
+    parquet_buffer = io.BytesIO()
+    sample_df.to_parquet(parquet_buffer, index=False)
+    parquet_buffer.seek(0)
+    st.download_button(
+        label="Download sample-level Parquet",
+        data=parquet_buffer,
+        file_name="edge_samples.parquet",
+        mime="application/octet-stream",
+    )
+
+    # ---------------------------------------------------------------------
+    # Plots (tabs)
+    # ---------------------------------------------------------------------
+
+    (
+        tab_roi,
+        tab_residual,
+        tab_hist_qq,
+        tab_ler,
+        tab_width,
+        tab_psd,
+        tab_corr,
+        tab_sigmaL,
+        tab_heatmap,
+        tab_anomaly,
+    ) = st.tabs(
+        [
+            "ROI + edges",
+            "Residual vs position",
+            "Histogram & Q–Q",
+            "LER summary",
+            "Width vs position",
+            "PSD",
+            "Correlation",
+            "σ(L) curve",
+            "Roughness heatmap",
+            "Anomaly vs position",
+        ]
+    )
+
+    with tab_roi:
+        fig = plot_roi_with_edges(roi, analysis, nm_per_pixel)
+        st.pyplot(fig, clear_figure=True)
+
+    with tab_residual:
+        fig = plot_residual_traces(analysis, nm_per_pixel)
+        st.pyplot(fig, clear_figure=True)
+
+    with tab_hist_qq:
+        fig = plot_hist_and_qq(analysis, nm_per_pixel)
+        st.pyplot(fig, clear_figure=True)
+
+    with tab_ler:
+        fig = plot_ler_summary(analysis)
+        st.pyplot(fig, clear_figure=True)
+
+    with tab_width:
+        if analysis.widths:
+            fig = plot_width_vs_position(analysis, nm_per_pixel)
+            st.pyplot(fig, clear_figure=True)
+        else:
+            st.info("Not enough edges to build line-width traces (need ≥ 2 edges).")
+
+    with tab_psd:
+        fig = plot_psd(analysis)
+        st.pyplot(fig, clear_figure=True)
+
+    with tab_corr:
+        fig = plot_correlation(analysis)
+        st.pyplot(fig, clear_figure=True)
+
+    with tab_sigmaL:
+        fig = plot_sigma_L(analysis)
+        st.pyplot(fig, clear_figure=True)
+
+    with tab_heatmap:
+        fig = plot_roughness_heatmap(analysis, nm_per_pixel)
+        st.pyplot(fig, clear_figure=True)
+
+    with tab_anomaly:
+        fig = plot_anomaly_scores(analysis, nm_per_pixel)
+        st.pyplot(fig, clear_figure=True)
+
+
+if __name__ == "__main__":
+    main()
