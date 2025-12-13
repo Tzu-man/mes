@@ -1,0 +1,139 @@
+import numpy as np
+import cv2
+from skimage import filters, measure
+from skimage.draw import ellipse
+import matplotlib.pyplot as plt
+
+def analyze_sem_image(image, ellipse_roi):
+    """
+    Full processing flow: Segmentation -> LER -> ROI Analysis
+    
+    Parameters:
+    - image: 2D numpy array (16-bit grayscale)
+    - ellipse_roi: Tuple (row_center, col_center, r_radius, c_radius)
+    """
+    
+    # --- 1. PRE-PROCESSING (Noise Reduction) ---
+    # Convert to float32 to prevent overflow during processing
+    img_float = image.astype(np.float32)
+    
+    # Bilateral Filter: Smooths noise while preserving sharp edges
+    # d=5: Filter neighborhood size
+    # sigmaColor: Large value for 16-bit dynamic range
+    # sigmaSpace: Spatial proximity weight
+    denoised = cv2.bilateralFilter(img_float, d=5, sigmaColor=10000, sigmaSpace=5)
+    
+    # --- 2. ROBUST SEGMENTATION (Multi-Otsu) ---
+    # We assume 3 classes for SEM: 
+    # 0: Dark Background (Space)
+    # 1: Gray Line (Resist/Metal)
+    # 2: Bright Edge (Blooming/Sidewall)
+    try:
+        thresholds = filters.threshold_multiotsu(denoised, classes=3)
+        regions = np.digitize(denoised, bins=thresholds)
+    except ValueError:
+        # Fallback to standard Otsu if only 2 classes are distinct
+        thresh = filters.threshold_otsu(denoised)
+        regions = (denoised > thresh).astype(int)
+
+    # Define the mask for the line. 
+    # Usually, we want the outer boundary of the "Bright Edge" (regions >= 1).
+    binary_mask = (regions >= 1).astype(np.uint8) 
+    
+    # --- 3. SUB-PIXEL EDGE DETECTION ---
+    # Find contours at the transition from 0 to 1 (Space to Line/Edge)
+    # level=0.5 gives sub-pixel precision on the binary mask
+    contours = measure.find_contours(binary_mask, 0.5)
+    
+    # Filter contours to keep only the main vertical lines
+    line_edges = []
+    image_height = image.shape[0]
+    for contour in contours:
+        # Filter small noise artifacts (must be at least 80% of image height)
+        if len(contour) > image_height * 0.8:
+            # Check orientation: Vertical lines have low column variance relative to row variance
+            if np.std(contour[:, 1]) < image.shape[1] * 0.1: 
+                # Sort by Y (row) for easy matching later
+                sorted_contour = contour[np.argsort(contour[:, 0])]
+                line_edges.append(sorted_contour)
+
+    # --- 4. LER & CD CALCULATION ---
+    # Sort edges by X position to pair them (Left, Right)
+    line_edges.sort(key=lambda x: np.mean(x[:, 1]))
+    
+    global_residuals = []
+    cd_measurements = [] # List of {'y': y, 'cd': width, 'x': center_x}
+    
+    # Iterate through pairs of edges (Left, Right) to form a Line
+    for i in range(0, len(line_edges) - 1, 2):
+        edge_l = line_edges[i]
+        edge_r = line_edges[i+1]
+        
+        # Interpolate edges to a common Y grid to calculate width
+        min_y = max(np.min(edge_l[:, 0]), np.min(edge_r[:, 0]))
+        max_y = min(np.max(edge_l[:, 0]), np.max(edge_r[:, 0]))
+        y_common = np.arange(np.ceil(min_y), np.floor(max_y))
+        
+        if len(y_common) == 0: continue
+
+        x_l_interp = np.interp(y_common, edge_l[:, 0], edge_l[:, 1])
+        x_r_interp = np.interp(y_common, edge_r[:, 0], edge_r[:, 1])
+        
+        # Calculate CD (Width)
+        width = x_r_interp - x_l_interp
+        center_x = (x_r_interp + x_l_interp) / 2
+        
+        for y, w, cx in zip(y_common, width, center_x):
+            cd_measurements.append({'y': y, 'cd': w, 'x': cx})
+
+        # Calculate LER (Deviation from a straight line fit)
+        # We detrend each edge individually to separate roughness from tilt/bow
+        for x_edge in [x_l_interp, x_r_interp]:
+            # Fit linear trend: x = my + c
+            poly = np.polyfit(y_common, x_edge, 1)
+            fit = np.polyval(poly, y_common)
+            residuals = x_edge - fit
+            global_residuals.extend(residuals)
+
+    # Compute Global Statistics
+    ler_3sigma = 3 * np.std(global_residuals) # Industry standard 3-sigma LER
+    
+    all_cds = np.array([m['cd'] for m in cd_measurements])
+    global_mean_cd = np.mean(all_cds)
+    global_cd_sigma = np.std(all_cds)
+    
+    # --- 5. ELLIPSE ROI ANALYSIS ---
+    # Create a mask for the user-specified ellipse
+    rr, cc = ellipse(ellipse_roi[0], ellipse_roi[1], ellipse_roi[2], ellipse_roi[3], shape=image.shape)
+    mask_roi = np.zeros_like(image, dtype=bool)
+    mask_roi[rr, cc] = True
+    
+    # Extract CD measurements strictly inside the ellipse
+    local_cds = []
+    for m in cd_measurements:
+        py, px = int(m['y']), int(m['x'])
+        if 0 <= py < image.shape[0] and 0 <= px < image.shape[1]:
+            if mask_roi[py, px]:
+                local_cds.append(m['cd'])
+                
+    local_mean_cd = np.mean(local_cds) if local_cds else 0
+    
+    # Calculate Deviation (Z-Score)
+    # How far is the local area from the global average, in units of global noise?
+    deviation = local_mean_cd - global_mean_cd
+    z_score = deviation / global_cd_sigma if global_cd_sigma > 0 else 0
+    
+    return {
+        'ler_3sigma': ler_3sigma,
+        'global_mean_cd': global_mean_cd,
+        'global_cd_sigma': global_cd_sigma,
+        'local_mean_cd': local_mean_cd,
+        'z_score': z_score,
+        'regions': regions, # For visualization
+        'contours': contours # For visualization
+    }
+
+# --- Example Usage ---
+# Assuming 'img_16bit' is your loaded numpy array and 'roi' is defined
+# roi = (y_center, x_center, y_radius, x_radius)
+# results = analyze_sem_image(img_16bit, roi)
