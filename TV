@@ -1,0 +1,67 @@
+import numpy as np
+import cv2
+from skimage import restoration, exposure, util
+import matplotlib.pyplot as plt
+
+def advanced_denoising_and_sharpening(image_16bit, tv_weight=0.1, unsharp_alpha=1.5):
+    """
+    Applies SOTA techniques (TV Denoising + Adaptive Sharpening) for high-noise SEM.
+    
+    Parameters:
+    - image_16bit: Input 16-bit grayscale image.
+    - tv_weight: Denoising strength (higher = more smoothing). 0.05 to 0.15 is typical.
+    - unsharp_alpha: Sharpening gain.
+    
+    Returns:
+    - An 8-bit image with emphasized boundaries.
+    """
+    # 1. Normalization and Conversion to Float
+    # Scale image to 0-1 range for robust float-based processing
+    img_float = util.img_as_float(image_16bit)
+    
+    # 2. Total Variation (TV) Denoising
+    # This is the core SOTA step for strong noise while preserving edges.
+    # We use the fast 'chambolle' solver.
+    denoised_tv = restoration.denoise_tv_chambolle(
+        img_float, 
+        weight=tv_weight, 
+        channel_axis=None 
+    )
+    
+    # 3. Structure Enhancement (Adaptive Unsharp Masking)
+    # The image must be converted to 8-bit for efficient OpenCV processing 
+    # of the sharpening step (or use SciPy/NumPy convolution)
+    denoised_8bit = exposure.rescale_intensity(denoised_tv, out_range=(0, 255)).astype(np.uint8)
+
+    # 3a. Blur the denoised image (used to extract edges)
+    # Use a small kernel (3x3 or 5x5)
+    blurred = cv2.GaussianBlur(denoised_8bit, (5, 5), 0)
+    
+    # 3b. Calculate the difference (Edges = Original - Blurred)
+    edges = cv2.subtract(denoised_8bit, blurred)
+    
+    # 3c. Sharpen using the calculated edges (Unsharp Mask)
+    # This is the standard unsharp mask formula: Sharpened = Original + alpha * Edges
+    # Since the input is 8-bit, we use cv2.addWeighted for safe addition.
+    sharpened = cv2.addWeighted(denoised_8bit, 1.0, edges, unsharp_alpha, 0)
+    
+    # Optional: Apply contrast enhancement (CLAHE) for final visualization
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    final_image = clahe.apply(sharpened)
+    
+    return final_image
+
+# --- Example of Integration (assuming the previous 'img' exists) ---
+# NOTE: The TV algorithm is computationally intensive and can take a few seconds.
+
+# Assuming 'img' (the synthetic image from the previous response) is available:
+# final_clear_image = advanced_denoising_and_sharpening(img, tv_weight=0.15) 
+
+# # Visualization (Plotting code for comparison)
+# fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+# axes[0].imshow(img, cmap='gray')
+# axes[0].set_title('16-bit Noisy Input (Simulated)')
+# axes[1].imshow(final_clear_image, cmap='gray')
+# axes[1].set_title(f'SOTA Result (TV Denoising + Sharpening)')
+# plt.tight_layout()
+# plt.show()
