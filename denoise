@@ -1,0 +1,162 @@
+import numpy as np
+import cv2
+from skimage import restoration, filters
+from scipy import ndimage
+
+
+def enhance_sem_image(image, method='combined'):
+    """
+    Enhance noisy SEM image to reveal clear structure and boundaries.
+    
+    Parameters:
+    -----------
+    image : ndarray
+        Input grayscale 16-bit SEM image
+    method : str
+        'nlm': Non-local means only
+        'clahe': CLAHE + denoising
+        'combined': Full pipeline (recommended)
+        'coherence': Coherence-enhancing diffusion
+    
+    Returns:
+    --------
+    enhanced : ndarray (float32, 0-1 range)
+    """
+    img = image.astype(np.float32)
+    
+    # Normalize to 0-1
+    img = (img - img.min()) / (img.max() - img.min())
+    
+    if method == 'nlm':
+        return _nlm_denoise(img)
+    elif method == 'clahe':
+        return _clahe_enhance(img)
+    elif method == 'coherence':
+        return _coherence_enhance(img)
+    else:  # combined (best for most cases)
+        return _combined_pipeline(img)
+
+
+def _nlm_denoise(img):
+    """Non-local means - excellent for preserving edges"""
+    # Convert to uint8 for OpenCV NLM
+    img_8bit = (img * 255).astype(np.uint8)
+    denoised = cv2.fastNlMeansDenoising(img_8bit, h=10, templateWindowSize=7, searchWindowSize=21)
+    return denoised.astype(np.float32) / 255
+
+
+def _clahe_enhance(img):
+    """CLAHE for local contrast enhancement"""
+    # Denoise first
+    denoised = restoration.denoise_nl_means(img, h=0.05, patch_size=5, patch_distance=7, fast_mode=True)
+    
+    # Apply CLAHE
+    img_8bit = (np.clip(denoised, 0, 1) * 255).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(img_8bit)
+    
+    return enhanced.astype(np.float32) / 255
+
+
+def _coherence_enhance(img):
+    """Coherence-enhancing diffusion - follows structure directions"""
+    from skimage.filters import coherence
+    
+    # Denoise
+    denoised = restoration.denoise_tv_chambolle(img, weight=0.1)
+    
+    # Compute structure tensor
+    Axx, Axy, Ayy = coherence.structure_tensor(denoised, sigma=1.5)
+    
+    # Eigenvalues give coherence direction
+    eigvals = coherence.structure_tensor_eigenvalues(Axx, Axy, Ayy)
+    coherence_img = (eigvals[0] - eigvals[1]) / (eigvals[0] + eigvals[1] + 1e-10)
+    
+    return np.clip(coherence_img, 0, 1)
+
+
+def _combined_pipeline(img):
+    """Full SOTA pipeline for maximum clarity"""
+    
+    # Step 1: Non-local means denoising (preserves edges)
+    denoised = restoration.denoise_nl_means(
+        img, 
+        h=0.08,  # Higher h = more smoothing
+        patch_size=5, 
+        patch_distance=11,
+        fast_mode=True
+    )
+    
+    # Step 2: CLAHE for local contrast
+    img_8bit = (np.clip(denoised, 0, 1) * 255).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(img_8bit).astype(np.float32) / 255
+    
+    # Step 3: Unsharp masking for edge enhancement
+    gaussian = ndimage.gaussian_filter(enhanced, sigma=2)
+    unsharp = enhanced + 1.5 * (enhanced - gaussian)
+    unsharp = np.clip(unsharp, 0, 1)
+    
+    # Step 4: Morphological gradient for boundary emphasis
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    morph_grad = cv2.morphologyEx(
+        (unsharp * 255).astype(np.uint8), 
+        cv2.MORPH_GRADIENT, 
+        kernel
+    ).astype(np.float32) / 255
+    
+    # Blend original enhanced with gradient
+    result = 0.7 * unsharp + 0.3 * morph_grad
+    
+    return np.clip(result, 0, 1)
+
+
+def adaptive_bilateral_denoise(img, noise_level='medium'):
+    """
+    Adaptive bilateral filtering based on local noise estimation.
+    Good alternative to NLM, faster.
+    """
+    if noise_level == 'low':
+        d, sigma_color, sigma_space = 5, 30, 30
+    elif noise_level == 'high':
+        d, sigma_color, sigma_space = 9, 80, 80
+    else:  # medium
+        d, sigma_color, sigma_space = 7, 50, 50
+    
+    img_8bit = (img * 255).astype(np.uint8)
+    filtered = cv2.bilateralFilter(img_8bit, d, sigma_color, sigma_space)
+    
+    return filtered.astype(np.float32) / 255
+
+
+def compare_methods(image):
+    """Compare all enhancement methods side-by-side"""
+    results = {
+        'original': image.astype(np.float32) / image.max(),
+        'nlm': enhance_sem_image(image, 'nlm'),
+        'clahe': enhance_sem_image(image, 'clahe'),
+        'coherence': enhance_sem_image(image, 'coherence'),
+        'combined': enhance_sem_image(image, 'combined')
+    }
+    return results
+
+
+# Usage example
+if __name__ == "__main__":
+    # Load noisy SEM image
+    image = cv2.imread('noisy_sem.tif', cv2.IMREAD_UNCHANGED)
+    
+    # Method 1: Quick enhancement (recommended)
+    enhanced = enhance_sem_image(image, method='combined')
+    
+    # Method 2: If NLM is too slow, use bilateral
+    # enhanced = adaptive_bilateral_denoise(image.astype(np.float32) / 65535, 'medium')
+    
+    # Save result
+    result = (enhanced * 65535).astype(np.uint16)
+    cv2.imwrite('enhanced_sem.tif', result)
+    
+    # Or compare all methods
+    results = compare_methods(image)
+    for name, img in results.items():
+        cv2.imwrite(f'enhanced_{name}.tif', (img * 65535).astype(np.uint16))
