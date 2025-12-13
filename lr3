@@ -1,0 +1,659 @@
+from dataclasses import dataclass
+from typing import Dict, Any, Tuple, List
+
+import numpy as np
+import scipy.ndimage as ndi
+from skimage import filters, measure
+from scipy.stats import t
+import matplotlib.pyplot as plt
+
+
+# --------------------------------------------------------------------
+# 1. Robust preprocessing & basic geometry
+# --------------------------------------------------------------------
+
+def normalize_image_robust(img16: np.ndarray,
+                           clip_sigma: float = 4.0) -> np.ndarray:
+    """
+    Robust normalization of a 16-bit SEM image:
+
+    - subtract median
+    - divide by MAD (converted to sigma)
+    - clip to +/- clip_sigma
+    - rescale to [0,1]
+
+    This makes the flow largely invariant to global GL gain/offset.
+    """
+    img = img16.astype(np.float32)
+    med = np.median(img)
+    mad = np.median(np.abs(img - med)) + 1e-6
+    sigma = 1.4826 * mad  # MAD -> sigma under normality
+
+    z = (img - med) / sigma
+    z = np.clip(z, -clip_sigma, clip_sigma)
+    z = (z + clip_sigma) / (2.0 * clip_sigma)
+    return z
+
+
+def ellipse_mask(shape: Tuple[int, int],
+                 cy: float, cx: float,
+                 ry: float, rx: float,
+                 theta: float) -> np.ndarray:
+    """
+    Boolean mask for an ellipse parameterized by center (cy,cx),
+    semi-axes (ry,rx) and rotation theta (radians, CCW).
+    """
+    H, W = shape
+    Y, X = np.indices((H, W))
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    x = X - cx
+    y = Y - cy
+    xr = cos_t * x + sin_t * y
+    yr = -sin_t * x + cos_t * y
+    return (xr**2 / (rx**2 + 1e-6) + yr**2 / (ry**2 + 1e-6)) <= 1.0
+
+
+# --------------------------------------------------------------------
+# 2. Segmentation model: 1D line-profile edge extraction
+# --------------------------------------------------------------------
+
+def extract_line_edges_1d(image16: np.ndarray,
+                          sigma_x: float = 1.0,
+                          min_run: int = 2) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Segment bright line-space pattern and extract left/right edges
+    for each row using a 1D profile method, tailored for 16-bit SEM.
+
+    Parameters
+    ----------
+    image16 : np.ndarray
+        16-bit SEM image (H,W).
+    sigma_x : float
+        Std dev for Gaussian smoothing along x (columns) in pixels.
+        Use ~0.5–1.5 px depending on noise.
+    min_run : int
+        Minimum length (in pixels) of a bright run to be considered a line.
+
+    Returns
+    -------
+    x_left, x_right : np.ndarray
+        Arrays of shape (H, K) with sub-pixel x positions of left and right
+        edges for K lines. Missing edges are NaN.
+
+    Notes
+    -----
+    - This is close in spirit to line-profile based LER extraction used
+      in low-dose SEM metrology: smooth, threshold, then detect peak
+      transitions to get edges with sub-pixel interpolation.
+    """
+    img = normalize_image_robust(image16)
+
+    # Smooth along x only, to reduce noise but keep line structure along y
+    smooth = ndi.gaussian_filter(img, sigma=(0.0, sigma_x))
+
+    # Global threshold to separate bright lines from dark spaces
+    thr = filters.threshold_otsu(smooth)
+    binary = smooth > thr
+
+    H, W = img.shape
+
+    # Estimate typical number of bright segments (lines) per row
+    counts = []
+    for y in range(H):
+        labels = measure.label(binary[y], connectivity=1)
+        ns = 0
+        for lab in range(1, labels.max() + 1):
+            xs = np.where(labels == lab)[0]
+            if xs.size >= min_run:
+                ns += 1
+        counts.append(ns)
+    counts = np.array(counts)
+    nz = counts[counts > 0]
+    if nz.size == 0:
+        raise RuntimeError("No line segments detected in any row.")
+    K = int(np.median(nz))  # typical #lines
+
+    x_left = np.full((H, K), np.nan, dtype=np.float32)
+    x_right = np.full((H, K), np.nan, dtype=np.float32)
+
+    for y in range(H):
+        row_bin = binary[y]
+        labels = measure.label(row_bin, connectivity=1)
+        segs: List[Tuple[int, int]] = []
+        for lab in range(1, labels.max() + 1):
+            xs = np.where(labels == lab)[0]
+            if xs.size < min_run:
+                continue
+            segs.append((xs[0], xs[-1]))
+        if len(segs) != K:
+            # Skip rows where segmentation clearly fails (near borders, severe defects)
+            continue
+
+        segs.sort(key=lambda s: s[0])
+        row_int = smooth[y]
+
+        for k, (xl, xr) in enumerate(segs):
+            # Left edge: interpolate threshold crossing just before xl
+            i0 = xl - 1
+            if i0 < 0:
+                x_sub_L = float(xl)
+            else:
+                v0 = row_int[i0]
+                v1 = row_int[xl]
+                if v1 == v0:
+                    x_sub_L = float(xl)
+                else:
+                    t_rel = (thr - v0) / (v1 - v0)
+                    t_rel = np.clip(t_rel, 0.0, 1.0)
+                    x_sub_L = i0 + t_rel
+            x_left[y, k] = x_sub_L
+
+            # Right edge: interpolate threshold crossing just after xr
+            i0 = xr
+            i1 = xr + 1
+            if i1 >= W:
+                x_sub_R = float(xr)
+            else:
+                v0 = row_int[i0]
+                v1 = row_int[i1]
+                if v1 == v0:
+                    x_sub_R = float(xr)
+                else:
+                    t_rel = (thr - v0) / (v1 - v0)
+                    t_rel = np.clip(t_rel, 0.0, 1.0)
+                    x_sub_R = i0 + t_rel
+            x_right[y, k] = x_sub_R
+
+    return x_left, x_right
+
+
+# --------------------------------------------------------------------
+# 3. Bayesian LER model (Normal–Inverse-Gamma)
+# --------------------------------------------------------------------
+
+@dataclass
+class NormalInvGammaModel:
+    mu: float
+    kappa: float
+    alpha: float
+    beta: float
+
+
+def fit_normal_inverse_gamma(residuals: np.ndarray,
+                             mu0: float = 0.0,
+                             kappa0: float = 1e-3,
+                             alpha0: float = 2.0,
+                             beta0: float = None) -> NormalInvGammaModel:
+    """
+    Fit Normal–Inverse-Gamma posterior to 1D residuals.
+
+    This is used to model the distribution of edge deviations under H0 (LER only).
+    """
+    x = np.asarray(residuals, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    n = x.size
+    if n == 0:
+        raise ValueError("No residuals to fit.")
+    xbar = x.mean()
+    s2 = x.var(ddof=1) if n > 1 else 0.0
+
+    if beta0 is None:
+        # Weak prior scale from data to avoid numerical issues
+        beta0 = 0.5 * max(n, 1) * max(s2, 1e-6)
+
+    kappa_n = kappa0 + n
+    mu_n = (kappa0 * mu0 + n * xbar) / kappa_n
+    alpha_n = alpha0 + 0.5 * n
+    ss = np.sum((x - xbar) ** 2)
+    beta_n = beta0 + 0.5 * ss + (kappa0 * n * (xbar - mu0) ** 2) / (2.0 * kappa_n)
+
+    return NormalInvGammaModel(mu=mu_n, kappa=kappa_n, alpha=alpha_n, beta=beta_n)
+
+
+def posterior_predictive_student_t_params(model: NormalInvGammaModel) -> Tuple[float, float, float]:
+    """
+    Student-t predictive parameters for a new residual:
+    df, loc, scale such that r ~ StudentT(df, loc, scale).
+    """
+    df = 2.0 * model.alpha
+    loc = model.mu
+    scale = np.sqrt(model.beta * (model.kappa + 1.0) / (model.alpha * model.kappa))
+    return df, loc, scale
+
+
+# --------------------------------------------------------------------
+# 4. Split residuals into background vs ellipse (deviation model)
+# --------------------------------------------------------------------
+
+def compute_ler_residuals_from_edges(
+        x_left: np.ndarray,
+        x_right: np.ndarray,
+        ellipse_msk: np.ndarray,
+        poly_order: int = 1
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Any, Any]:
+    """
+    Compute LER residuals for left/right edges, split into:
+    - background (outside ellipse)
+    - candidate region (inside ellipse)
+
+    For each line (column in x_left/x_right) we:
+    1. Fit a low-order polynomial baseline vs y for left and right edges.
+    2. Subtract the baseline to obtain residuals.
+    3. Use the line center to decide if the sample falls inside the ROI ellipse.
+
+    Returns
+    -------
+    residuals_bg_left, residuals_bg_right,
+    residuals_roi_left, residuals_roi_right,
+    baseline_left, baseline_right
+    """
+    H, K = x_left.shape
+    ys = np.arange(H)
+
+    residuals_bg_left = []
+    residuals_bg_right = []
+    residuals_roi_left = []
+    residuals_roi_right = []
+    baseline_left = []
+    baseline_right = []
+
+    def sample_in_roi(y_idx: float, x_l: float, x_r: float) -> bool:
+        if np.isnan(x_l) or np.isnan(x_r):
+            return None
+        x_mid = 0.5 * (x_l + x_r)
+        iy = int(round(y_idx))
+        ix = int(round(x_mid))
+        Hm, Wm = ellipse_msk.shape
+        if iy < 0 or iy >= Hm or ix < 0 or ix >= Wm:
+            return False
+        return bool(ellipse_msk[iy, ix])
+
+    for k in range(K):
+        xL = x_left[:, k]
+        xR = x_right[:, k]
+        valid = np.isfinite(xL) & np.isfinite(xR)
+        if valid.sum() <= poly_order:
+            continue
+
+        yk = ys[valid]
+        xLk = xL[valid]
+        xRk = xR[valid]
+
+        # Fit slow drift along y for each edge
+        coeffL = np.polyfit(yk, xLk, poly_order)
+        coeffR = np.polyfit(yk, xRk, poly_order)
+        baseline_left.append((k, coeffL))
+        baseline_right.append((k, coeffR))
+
+        fitL = np.polyval(coeffL, yk)
+        fitR = np.polyval(coeffR, yk)
+        resL = xLk - fitL
+        resR = xRk - fitR
+
+        for y_val, rL, rR, x_l_val, x_r_val in zip(yk, resL, resR, xLk, xRk):
+            inside = sample_in_roi(y_val, x_l_val, x_r_val)
+            if inside is None:
+                continue
+            if inside:
+                residuals_roi_left.append(rL)
+                residuals_roi_right.append(rR)
+            else:
+                residuals_bg_left.append(rL)
+                residuals_bg_right.append(rR)
+
+    return (np.asarray(residuals_bg_left, dtype=np.float32),
+            np.asarray(residuals_bg_right, dtype=np.float32),
+            np.asarray(residuals_roi_left, dtype=np.float32),
+            np.asarray(residuals_roi_right, dtype=np.float32),
+            baseline_left, baseline_right)
+
+
+# --------------------------------------------------------------------
+# 5. Posterior probability of defect (per residual)
+# --------------------------------------------------------------------
+
+def posterior_defect_probability(
+        residuals_roi: np.ndarray,
+        model: NormalInvGammaModel,
+        prior_defect: float = 0.01,
+        defect_scale_factor: float = 5.0
+) -> np.ndarray:
+    """
+    Compute posterior probability P(H1 | r) that each residual r is a defect
+    rather than typical LER, using a simple two-hypothesis Bayesian model:
+
+      H0: r ~ Student-t(df, loc, scale)  (LER model)
+      H1: r ~ Student-t(df, loc, defect_scale_factor * scale)  (broader tails)
+
+    Prior odds P(H1)/P(H0) are set by prior_defect.
+
+    Returns
+    -------
+    post : np.ndarray
+        Posterior probabilities for H1 for each residual.
+    """
+    r = np.asarray(residuals_roi, dtype=np.float64)
+    if r.size == 0:
+        return np.array([], dtype=np.float64)
+
+    df, loc0, scale0 = posterior_predictive_student_t_params(model)
+    scale1 = defect_scale_factor * scale0
+
+    # Predictive densities under H0 and H1
+    z0 = (r - loc0) / scale0
+    z1 = (r - loc0) / scale1
+    p0 = t.pdf(z0, df) / scale0
+    p1 = t.pdf(z1, df) / scale1
+
+    pi1 = float(prior_defect)
+    pi0 = 1.0 - pi1
+    num = pi1 * p1
+    den = pi1 * p1 + pi0 * p0
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        post = np.where(den > 0, num / den, 0.0)
+
+    return post
+
+
+# --------------------------------------------------------------------
+# 6. Publication-grade plotting of histograms + H0/H1
+# --------------------------------------------------------------------
+
+def plot_residual_histograms_with_models(
+        residuals_bg: np.ndarray,
+        residuals_roi: np.ndarray,
+        ler_model: NormalInvGammaModel,
+        defect_scale_factor: float = 5.0,
+        xlabel: str = r"Edge deviation $\Delta x$ [pixels]",
+        title: str = "Edge deviation within ROI vs global LER",
+        filename: str = None,
+        dpi: int = 300
+):
+    """
+    Publication-ready visualization:
+    - Histogram of background LER residuals
+    - Histogram of ROI residuals
+    - Predictive pdf under H0 (LER model)
+    - Predictive pdf under H1 (broader defect model)
+    """
+    residuals_bg = np.asarray(residuals_bg, dtype=np.float64)
+    residuals_roi = np.asarray(residuals_roi, dtype=np.float64)
+    if residuals_bg.size == 0:
+        raise ValueError("Background residuals array is empty.")
+
+    df, loc0, scale0 = posterior_predictive_student_t_params(ler_model)
+    scale1 = defect_scale_factor * scale0
+
+    all_res = residuals_bg
+    if residuals_roi.size > 0:
+        all_res = np.concatenate([all_res, residuals_roi])
+    lo, hi = np.percentile(all_res, [0.5, 99.5])
+    margin = 0.1 * (hi - lo)
+    x = np.linspace(lo - margin, hi + margin, 512)
+
+    pdf0 = t.pdf((x - loc0) / scale0, df) / scale0
+    pdf1 = t.pdf((x - loc0) / scale1, df) / scale1
+
+    plt.style.use("seaborn-v0_8-whitegrid")
+    fig, ax = plt.subplots(figsize=(6.0, 4.0), dpi=dpi)
+
+    bins = max(30, int(np.sqrt(residuals_bg.size)))
+    ax.hist(residuals_bg, bins=bins, density=True,
+            alpha=0.4, label="Global LER residuals (H0)",
+            edgecolor="none")
+    if residuals_roi.size > 0:
+        ax.hist(residuals_roi, bins=bins, density=True,
+                alpha=0.6, label="ROI residuals (candidate defect)",
+                edgecolor="none")
+
+    ax.plot(x, pdf0, "k-", linewidth=2.0, label=r"$p(\Delta x \mid H_0)$")
+    ax.plot(x, pdf1, "k--", linewidth=2.0, label=r"$p(\Delta x \mid H_1)$")
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Density")
+    ax.set_title(title)
+    ax.legend(frameon=True)
+    ax.tick_params(direction="in", length=4)
+
+    fig.tight_layout()
+    if filename is not None:
+        fig.savefig(filename, dpi=dpi, bbox_inches="tight")
+    return fig, ax
+
+
+# --------------------------------------------------------------------
+# 7. High-level wrapper for an ellipse
+# --------------------------------------------------------------------
+
+def analyze_ellipse(image16: np.ndarray,
+                    cy: float, cx: float,
+                    ry: float, rx: float,
+                    theta: float,
+                    sigma_x: float = 1.0,
+                    poly_order: int = 1,
+                    prior_defect: float = 0.01,
+                    defect_scale_factor: float = 5.0) -> Dict[str, Any]:
+    """
+    High-level wrapper:
+
+    1. Segment lines and extract left/right edges from the whole image.
+    2. Build LER models for left and right edges from background (outside ellipse).
+    3. Compute residuals inside the ellipse and their posterior defect probabilities.
+
+    Returns
+    -------
+    results : dict with keys:
+        - x_left, x_right
+        - residuals_bg_left, residuals_bg_right
+        - residuals_roi_left, residuals_roi_right
+        - model_left, model_right
+        - posterior_left, posterior_right  (P(defect | r) per ROI residual)
+        - ellipse_mask, baseline_left, baseline_right
+    """
+    x_left, x_right = extract_line_edges_1d(image16, sigma_x=sigma_x)
+    msk = ellipse_mask(image16.shape, cy, cx, ry, rx, theta)
+
+    (res_bg_L, res_bg_R,
+     res_roi_L, res_roi_R,
+     baseline_L, baseline_R) = compute_ler_residuals_from_edges(
+        x_left, x_right, msk, poly_order=poly_order
+    )
+
+    model_L = fit_normal_inverse_gamma(res_bg_L)
+    model_R = fit_normal_inverse_gamma(res_bg_R)
+
+    post_L = posterior_defect_probability(res_roi_L, model_L,
+                                          prior_defect=prior_defect,
+                                          defect_scale_factor=defect_scale_factor)
+    post_R = posterior_defect_probability(res_roi_R, model_R,
+                                          prior_defect=prior_defect,
+                                          defect_scale_factor=defect_scale_factor)
+
+    return {
+        "x_left": x_left,
+        "x_right": x_right,
+        "residuals_bg_left": res_bg_L,
+        "residuals_bg_right": res_bg_R,
+        "residuals_roi_left": res_roi_L,
+        "residuals_roi_right": res_roi_R,
+        "model_left": model_L,
+        "model_right": model_R,
+        "posterior_left": post_L,
+        "posterior_right": post_R,
+        "ellipse_mask": msk,
+        "baseline_left": baseline_L,
+        "baseline_right": baseline_R,
+    }
+
+
+
+
+results = analyze_ellipse(image16, cy, cx, ry, rx, theta)
+
+# Example: left-edge residuals
+fig, ax = plot_residual_histograms_with_models(
+    results["residuals_bg_left"],
+    results["residuals_roi_left"],
+    results["model_left"],
+    defect_scale_factor=5.0,
+    xlabel=r"Left edge deviation $\Delta x_L$ [pixels]",
+    title="Left edge deviations in ROI vs global LER",
+    filename="ler_left_edge_roi.png",
+    dpi=300,
+)
+
+
+
+
+# =============================================================
+    # --------------------------------------------------------
+    # 3. Run the full analysis for this ellipse
+    # --------------------------------------------------------
+    results = analyze_ellipse(
+        image16=img,
+        cy=cy,
+        cx=cx,
+        ry=ry,
+        rx=rx,
+        theta=theta,
+        sigma_x=1.0,       # smoothing along x for segmentation
+        poly_order=1,      # baseline order for LER
+        prior_defect=0.01, # prior P(H1)
+        defect_scale_factor=5.0  # how much broader H1 tails are
+    )
+
+    # Results dictionary contains:
+    #  - x_left, x_right
+    #  - residuals_bg_left, residuals_bg_right
+    #  - residuals_roi_left, residuals_roi_right
+    #  - model_left, model_right
+    #  - posterior_left, posterior_right
+    #  - ellipse_mask, baseline_left, baseline_right
+
+    print(f"Background left residuals: {results['residuals_bg_left'].shape}")
+    print(f"ROI left residuals:        {results['residuals_roi_left'].shape}")
+    print(f"Background right residuals: {results['residuals_bg_right'].shape}")
+    print(f"ROI right residuals:        {results['residuals_roi_right'].shape}")
+
+    # --------------------------------------------------------
+    # 4. Plot IEEE-quality histograms for left and right edges
+    # --------------------------------------------------------
+    fig_L, ax_L = plot_residual_histograms_with_models(
+        residuals_bg=results["residuals_bg_left"],
+        residuals_roi=results["residuals_roi_left"],
+        ler_model=results["model_left"],
+        defect_scale_factor=5.0,
+        xlabel=r"Left edge deviation $\Delta x_L$ [pixels]",
+        title="Left edge deviations in ROI vs global LER",
+        filename="left_edge_ler_roi.png",
+        dpi=300,
+    )
+
+    fig_R, ax_R = plot_residual_histograms_with_models(
+        residuals_bg=results["residuals_bg_right"],
+        residuals_roi=results["residuals_roi_right"],
+        ler_model=results["model_right"],
+        defect_scale_factor=5.0,
+        xlabel=r"Right edge deviation $\Delta x_R$ [pixels]",
+        title="Right edge deviations in ROI vs global LER",
+        filename="right_edge_ler_roi.png",
+        dpi=300,
+    )
+
+    print("Saved plots: left_edge_ler_roi.png, right_edge_ler_roi.png")
+
+    # --------------------------------------------------------
+    # 5. Simple summary statistics: how “suspicious” is this ellipse?
+    # --------------------------------------------------------
+    post_L = results["posterior_left"]
+    post_R = results["posterior_right"]
+
+    if post_L.size > 0:
+        print("Left edge: max P(defect | r) in ROI =", post_L.max())
+        print("Left edge: mean P(defect | r) in ROI =", post_L.mean())
+    else:
+        print("No left-edge residuals inside ROI.")
+
+    if post_R.size > 0:
+        print("Right edge: max P(defect | r) in ROI =", post_R.max())
+        print("Right edge: mean P(defect | r) in ROI =", post_R.mean())
+    else:
+        print("No right-edge residuals inside ROI.")
+
+    # Optional: show plots interactively
+    plt.show()
+
+
+
+def compute_width_residuals_in_roi(x_left, x_right, ellipse_mask, poly_order=1):
+    """Compute width residuals w = (xR - xL) - baseline(y) and
+    split into bg vs ROI, similar to edge residuals."""
+    H, K = x_left.shape
+    ys = np.arange(H)
+
+    width_bg = []
+    width_roi = []
+
+    def in_roi(y_idx, x_l, x_r):
+        if np.isnan(x_l) or np.isnan(x_r):
+            return None
+        x_mid = 0.5 * (x_l + x_r)
+        iy = int(round(y_idx))
+        ix = int(round(x_mid))
+        Hm, Wm = ellipse_mask.shape
+        if iy < 0 or iy >= Hm or ix < 0 or ix >= Wm:
+            return False
+        return bool(ellipse_mask[iy, ix])
+
+    for k in range(K):
+        xL = x_left[:, k]
+        xR = x_right[:, k]
+        valid = np.isfinite(xL) & np.isfinite(xR)
+        if valid.sum() <= poly_order:
+            continue
+
+        yk = ys[valid]
+        wk = xR[valid] - xL[valid]
+
+        # slow drift of width along y (baseline)
+        coeff_w = np.polyfit(yk, wk, poly_order)
+        fit_w = np.polyval(coeff_w, yk)
+        res_w = wk - fit_w
+
+        for y_val, rw, xl, xr in zip(yk, res_w, xL[valid], xR[valid]):
+            inside = in_roi(y_val, xl, xr)
+            if inside is None:
+                continue
+            if inside:
+                width_roi.append(rw)
+            else:
+                width_bg.append(rw)
+
+    return np.asarray(width_bg, dtype=np.float32), np.asarray(width_roi, dtype=np.float32)
+
+
+
+
+from ler_bayes import fit_normal_inverse_gamma
+
+# Compute width residuals
+width_bg, width_roi = compute_width_residuals_in_roi(
+    results["x_left"], results["x_right"], results["ellipse_mask"], poly_order=1
+)
+
+# Fit Bayesian model for width
+width_model = fit_normal_inverse_gamma(width_bg)
+
+# Plot
+fig_W, ax_W = plot_residual_histograms_with_models(
+    residuals_bg=width_bg,
+    residuals_roi=width_roi,
+    ler_model=width_model,
+    defect_scale_factor=5.0,
+    xlabel=r"Width deviation $\Delta w$ [pixels]",
+    title="Width deviations in ROI vs global width statistics",
+    filename="width_deviation_ler_roi.png",
+    dpi=300,
+)
+
