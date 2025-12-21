@@ -1,0 +1,1486 @@
+"""
+Line Roughness & Bridge-Detection Toolkit
+=========================================
+
+Interactive UI for:
+
+- Loading a SEM image (multi-channel TIFF or regular grayscale/RGB)
+- Optional loading of a ground-truth defect mask
+- Selecting which channel to analyze
+- Cropping a ROI (numeric margins, in pixels)
+- Segmenting vertical bright lines via 1D x-projection + Otsu threshold
+- Measuring line-edge roughness (left/right edges & centerline)
+- Computing global roughness statistics (per line and per edge)
+- Detecting bridge / "almost-bridge" anomalies between neighboring lines
+- Visualizing segmentation, roughness overlays, histograms
+- Exporting CSV / Parquet tables for downstream analysis
+
+Run with:
+    streamlit run line_roughness_bridge_ui.py
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+import os
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import streamlit as st
+import tifffile as tiff
+from scipy import ndimage as ndi
+
+# -------------------------------------------------------------------------
+# Logging configuration
+# -------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("roughness_bridge_ui")
+
+
+# -------------------------------------------------------------------------
+# Core data structures
+# -------------------------------------------------------------------------
+
+
+@dataclass
+class EdgeExtreme:
+    """Single extreme point on an edge (max/min distance to centerline)."""
+
+    x: float
+    y: int
+    dist_to_center: float
+
+
+@dataclass
+class EdgeSideStats:
+    """
+    Statistics for a single side of a line (left/right edge),
+    measured along y (rows).
+    """
+
+    x: np.ndarray  # edge x-position per y
+    y: np.ndarray  # row indices
+    mean_x: float
+    std_x: float
+    ci_low_x: float
+    ci_high_x: float
+    mean_dist_to_center: float
+    std_dist_to_center: float
+    ci_low_dist: float
+    ci_high_dist: float
+    extreme_inner: EdgeExtreme  # closest point to centerline
+    extreme_outer: EdgeExtreme  # farthest point from centerline
+
+
+@dataclass
+class LineRoughnessStats:
+    """
+    Roughness statistics per connected bright line.
+    Assumes vertical lines: left/right edge extracted per row.
+    """
+
+    label_id: int
+    y: np.ndarray  # sorted list of rows for this line
+    center_x: np.ndarray  # centerline x per row
+    center_mean_x: float
+    center_std_x: float
+    width: np.ndarray  # CD per row (right_x - left_x)
+    width_mean: float
+    width_std: float
+    left_edge: EdgeSideStats
+    right_edge: EdgeSideStats
+
+
+@dataclass
+class BridgeAnomaly:
+    """Single bridge / almost-bridge anomaly between two neighboring lines."""
+
+    left_line_id: int
+    right_line_id: int
+    x_center_px: float
+    y_px: int
+    gap_px: float
+    z_global: float
+    z_pair: float
+
+
+# -------------------------------------------------------------------------
+# Utility: Loading images & masks
+# -------------------------------------------------------------------------
+
+
+def load_sem_image_multichannel(uploaded_file) -> np.ndarray:
+    """
+    Load a SEM image as a float32 array of shape (C, H, W) in [0, 1].
+
+    - TIFF: use tifffile (supporting multi-channel / multi-page).
+    - Other formats: use OpenCV, convert to grayscale (single channel).
+    """
+    file_bytes = uploaded_file.read()
+    filename = uploaded_file.name.lower()
+
+    # Load
+    if filename.endswith((".tif", ".tiff")):
+        with tiff.TiffFile(io.BytesIO(file_bytes)) as tif:
+            arr = tif.asarray()
+    else:
+        file_array = np.asarray(bytearray(file_bytes), dtype=np.uint8)
+        img = cv2.imdecode(file_array, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise ValueError("Failed to decode image file.")
+        if img.ndim == 2:
+            arr = img[np.newaxis, ...]  # (1, H, W)
+        else:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            arr = gray[np.newaxis, ...]  # (1, H, W)
+
+    arr = np.asarray(arr)
+
+    # Normalize shape to (C, H, W)
+    if arr.ndim == 2:
+        arr = arr[np.newaxis, ...]  # (1, H, W)
+    elif arr.ndim == 3:
+        # (C, H, W) vs (H, W, C)
+        if arr.shape[0] <= 5 and arr.shape[0] <= arr.shape[1] and arr.shape[0] <= arr.shape[2]:
+            # Assume already (C, H, W)
+            pass
+        elif arr.shape[-1] <= 5:
+            # Assume (H, W, C)
+            arr = np.moveaxis(arr, -1, 0)
+        else:
+            # Fallback: first slice as a single channel
+            arr = arr[:1, ...]
+    else:
+        # Collapse extra dimensions (e.g. Z, C, H, W -> take first volume)
+        while arr.ndim > 3:
+            arr = arr[0]
+        if arr.ndim == 2:
+            arr = arr[np.newaxis, ...]
+        elif arr.ndim == 3:
+            if arr.shape[0] <= 5:
+                pass
+            elif arr.shape[-1] <= 5:
+                arr = np.moveaxis(arr, -1, 0)
+            else:
+                arr = arr[:1, ...]
+        else:
+            raise ValueError(f"Unsupported image shape {arr.shape}")
+
+    # Normalize each channel independently to [0, 1]
+    arr = arr.astype(np.float32)
+    for c in range(arr.shape[0]):
+        ch = arr[c]
+        ch_min = float(ch.min())
+        ch_max = float(ch.max())
+        if ch_max > ch_min:
+            arr[c] = (ch - ch_min) / (ch_max - ch_min)
+        else:
+            arr[c] = np.zeros_like(ch, dtype=np.float32)
+
+    logger.info("Loaded SEM image '%s' with shape (C,H,W)=%s", filename, arr.shape)
+    return arr
+
+
+def load_ground_truth_mask(uploaded_file) -> np.ndarray:
+    """
+    Load a ground-truth mask as a 2D integer array.
+
+    Non-zero values are treated as labeled regions (can be multiple classes).
+    """
+    file_bytes = uploaded_file.read()
+    filename = uploaded_file.name.lower()
+
+    if filename.endswith((".tif", ".tiff")):
+        with tiff.TiffFile(io.BytesIO(file_bytes)) as tif:
+            arr = tif.asarray()
+    else:
+        file_array = np.asarray(bytearray(file_bytes), dtype=np.uint8)
+        img = cv2.imdecode(file_array, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise ValueError("Failed to decode mask file.")
+        arr = img
+
+    arr = np.asarray(arr)
+
+    # Reduce to 2D if needed
+    if arr.ndim == 3:
+        # Take first channel if mask was RGB
+        arr = arr[..., 0]
+    elif arr.ndim != 2:
+        raise ValueError(f"Unsupported mask shape {arr.shape}")
+
+    mask = arr.astype(np.int32)
+    logger.info("Loaded ground-truth mask '%s' with shape %s", filename, mask.shape)
+    return mask
+
+
+def crop_image_numeric_2d(
+    image2d: np.ndarray,
+    crop_top: int,
+    crop_bottom: int,
+    crop_left: int,
+    crop_right: int,
+) -> np.ndarray:
+    """Crop a 2D array using numeric margins from each side (in pixels)."""
+    h, w = image2d.shape
+    top = max(0, crop_top)
+    left = max(0, crop_left)
+    bottom = max(0, h - crop_bottom)
+    right = max(0, w - crop_right)
+    roi = image2d[top:bottom, left:right]
+    return roi
+
+
+def extract_defect_id_from_filename(filename: str) -> str:
+    """
+    Strip common suffixes like '_image', '_mask' and file extension
+    to get a simple defect identifier.
+    """
+    base = os.path.basename(filename)
+    name, _ext = os.path.splitext(base)
+    for suffix in ("_image", "_img", "_mask"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+# -------------------------------------------------------------------------
+# Step 1: 1D x-projection + Otsu segmentation
+# -------------------------------------------------------------------------
+
+
+def otsu_threshold_1d(values: np.ndarray, num_bins: int = 256) -> float:
+    """Compute Otsu threshold for a 1D array."""
+    v = np.asarray(values, dtype=float)
+    if v.size == 0:
+        raise ValueError("Cannot threshold an empty array.")
+
+    v_min = float(v.min())
+    v_max = float(v.max())
+    if v_min == v_max:
+        return v_min
+
+    hist, bin_edges = np.histogram(v, bins=num_bins, range=(v_min, v_max))
+    hist = hist.astype(float)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    total = float(v.size)
+    weight1 = np.cumsum(hist)
+    weight2 = total - weight1
+
+    cumulative_mean = np.cumsum(hist * bin_centers)
+    total_mean = cumulative_mean[-1]
+
+    mean1 = np.zeros_like(hist, dtype=float)
+    mean2 = np.zeros_like(hist, dtype=float)
+
+    nonzero1 = weight1 > 0
+    nonzero2 = weight2 > 0
+
+    mean1[nonzero1] = cumulative_mean[nonzero1] / weight1[nonzero1]
+    mean2[nonzero2] = (total_mean - cumulative_mean[nonzero2]) / weight2[nonzero2]
+
+    inter_class_var = weight1 * weight2 * (mean1 - mean2) ** 2
+    idx = int(np.argmax(inter_class_var))
+    return float(bin_centers[idx])
+
+
+def segment_lines_otsu_x_projection(
+    image: np.ndarray,
+) -> Tuple[np.ndarray, float, np.ndarray]:
+    """
+    Segment bright vertical lines using:
+
+    - x-projection: mean intensity per column
+    - Otsu threshold on the 1D projection
+    - Broadcast resulting 1D mask back to 2D (constant in y)
+
+    Returns:
+        segmentation: bool array, True where "metal line"
+        threshold: Otsu threshold on x-projection
+        projection: 1D array, mean intensity per column
+    """
+    img = np.asarray(image, dtype=float)
+    if img.ndim != 2:
+        raise ValueError("segment_lines_otsu_x_projection expects a 2D image.")
+
+    projection = img.mean(axis=0)  # shape (W,)
+    threshold = otsu_threshold_1d(projection)
+    mask_x = projection >= threshold
+    segmentation = np.tile(mask_x, (img.shape[0], 1))  # broadcast along y
+    return segmentation.astype(bool), threshold, projection
+
+
+# -------------------------------------------------------------------------
+# Step 2: Per-line roughness measurement
+# -------------------------------------------------------------------------
+
+
+def _extract_edges_for_label(label_mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Given a single connected component mask (True for that line), extract:
+
+    - y_coords: sorted list of rows where the line exists
+    - x_left[y]: leftmost True pixel per row
+    - x_right[y]: rightmost True pixel per row
+    """
+    ys, xs = np.nonzero(label_mask)
+    if ys.size == 0:
+        raise ValueError("Empty line mask supplied.")
+
+    # Sort by (y, x)
+    order = np.lexsort((xs, ys))
+    ys_sorted = ys[order]
+    xs_sorted = xs[order]
+
+    # Find ranges per row
+    unique_y, start_idx = np.unique(ys_sorted, return_index=True)
+    end_idx = np.empty_like(start_idx)
+    end_idx[:-1] = start_idx[1:]
+    end_idx[-1] = xs_sorted.size
+
+    x_left = np.empty_like(unique_y, dtype=float)
+    x_right = np.empty_like(unique_y, dtype=float)
+
+    for i, (s, e) in enumerate(zip(start_idx, end_idx)):
+        xvals = xs_sorted[s:e]
+        x_left[i] = float(xvals[0])
+        x_right[i] = float(xvals[-1])
+
+    return unique_y.astype(int), x_left, x_right
+
+
+def _compute_edge_stats(
+    y: np.ndarray,
+    x_edge: np.ndarray,
+    x_center: np.ndarray,
+) -> EdgeSideStats:
+    """
+    Compute statistics for a single edge (left or right).
+
+    - Mean / std of x positions
+    - 95% CI (empirical quantiles) for x
+    - Distances to centerline and their mean/std/quantiles
+    - Inner / outer most points (closest/farthest from centerline)
+    """
+    if not (y.shape == x_edge.shape == x_center.shape):
+        raise ValueError("y, x_edge, x_center must have the same shape.")
+
+    mean_x = float(np.mean(x_edge))
+    std_x = float(np.std(x_edge, ddof=1)) if x_edge.size > 1 else 0.0
+    ci_low_x, ci_high_x = np.quantile(x_edge, [0.025, 0.975])
+
+    dist_to_center = np.abs(x_center - x_edge)
+    mean_dist = float(np.mean(dist_to_center))
+    std_dist = float(np.std(dist_to_center, ddof=1)) if dist_to_center.size > 1 else 0.0
+    ci_low_dist, ci_high_dist = np.quantile(dist_to_center, [0.025, 0.975])
+
+    idx_inner = int(np.argmin(dist_to_center))
+    idx_outer = int(np.argmax(dist_to_center))
+
+    extreme_inner = EdgeExtreme(
+        x=float(x_edge[idx_inner]),
+        y=int(y[idx_inner]),
+        dist_to_center=float(dist_to_center[idx_inner]),
+    )
+    extreme_outer = EdgeExtreme(
+        x=float(x_edge[idx_outer]),
+        y=int(y[idx_outer]),
+        dist_to_center=float(dist_to_center[idx_outer]),
+    )
+
+    return EdgeSideStats(
+        x=x_edge.astype(float),
+        y=y.astype(int),
+        mean_x=mean_x,
+        std_x=std_x,
+        ci_low_x=float(ci_low_x),
+        ci_high_x=float(ci_high_x),
+        mean_dist_to_center=mean_dist,
+        std_dist_to_center=std_dist,
+        ci_low_dist=float(ci_low_dist),
+        ci_high_dist=float(ci_high_dist),
+        extreme_inner=extreme_inner,
+        extreme_outer=extreme_outer,
+    )
+
+
+def measure_line_roughness(
+    segmentation: np.ndarray,
+    connectivity: int = 2,
+) -> List[LineRoughnessStats]:
+    """
+    Given a boolean segmentation (True = metal line), measure roughness for
+    each connected component.
+
+    Assumes vertical lines: we track left/right x per row (y).
+    """
+    seg = np.asarray(segmentation)
+    if seg.ndim != 2:
+        raise ValueError("Segmentation must be 2D.")
+    seg_bool = seg.astype(bool)
+
+    if not np.any(seg_bool):
+        raise ValueError("Segmentation is empty (no True pixels).")
+
+    labeled, num_labels = ndi.label(seg_bool, structure=np.ones((3, 3)))
+    logger.info("Found %d connected bright lines in segmentation.", num_labels)
+
+    stats_list: List[LineRoughnessStats] = []
+
+    for label_id in range(1, num_labels + 1):
+        line_mask = labeled == label_id
+        y_coords, x_left, x_right = _extract_edges_for_label(line_mask)
+
+        center_x = 0.5 * (x_left + x_right)
+        width = x_right - x_left
+
+        center_mean_x = float(np.mean(center_x))
+        center_std_x = float(np.std(center_x, ddof=1)) if center_x.size > 1 else 0.0
+        width_mean = float(np.mean(width))
+        width_std = float(np.std(width, ddof=1)) if width.size > 1 else 0.0
+
+        left_stats = _compute_edge_stats(y_coords, x_left, center_x)
+        right_stats = _compute_edge_stats(y_coords, x_right, center_x)
+
+        stats_list.append(
+            LineRoughnessStats(
+                label_id=label_id,
+                y=y_coords,
+                center_x=center_x,
+                center_mean_x=center_mean_x,
+                center_std_x=center_std_x,
+                width=width,
+                width_mean=width_mean,
+                width_std=width_std,
+                left_edge=left_stats,
+                right_edge=right_stats,
+            )
+        )
+
+    return stats_list
+
+
+# -------------------------------------------------------------------------
+# Step 3: Global roughness statistics (per-line, per-edge)
+# -------------------------------------------------------------------------
+
+
+def build_roughness_dfs(
+    line_stats_list: List[LineRoughnessStats],
+    pixel_size_nm: Optional[float] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Flatten LineRoughnessStats into two tables:
+
+    - df_lines: one row per line
+    - df_edges: one row per edge (left/right for each line)
+    """
+    line_records: List[Dict] = []
+    edge_records: List[Dict] = []
+
+    for line in line_stats_list:
+        line_records.append(
+            dict(
+                line_id=line.label_id,
+                center_sigma_px=line.center_std_x,
+                center_mean_x_px=line.center_mean_x,
+                width_mean_px=line.width_mean,
+                width_sigma_px=line.width_std,
+            )
+        )
+
+        for side_name, edge in (("left", line.left_edge), ("right", line.right_edge)):
+            ci_width_x = edge.ci_high_x - edge.ci_low_x
+
+            if edge.std_dist_to_center > 0:
+                inner_z = (edge.extreme_inner.dist_to_center - edge.mean_dist_to_center) / edge.std_dist_to_center
+                outer_z = (edge.extreme_outer.dist_to_center - edge.mean_dist_to_center) / edge.std_dist_to_center
+            else:
+                inner_z = np.nan
+                outer_z = np.nan
+
+            edge_records.append(
+                dict(
+                    line_id=line.label_id,
+                    side=side_name,
+                    ler_sigma_px=edge.std_x,
+                    mean_x_px=edge.mean_x,
+                    ci_low_x_px=edge.ci_low_x,
+                    ci_high_x_px=edge.ci_high_x,
+                    ci_width_x_px=ci_width_x,
+                    mean_dist_to_center_px=edge.mean_dist_to_center,
+                    std_dist_to_center_px=edge.std_dist_to_center,
+                    ci_low_dist_px=edge.ci_low_dist,
+                    ci_high_dist_px=edge.ci_high_dist,
+                    extreme_inner_x_px=edge.extreme_inner.x,
+                    extreme_inner_y=edge.extreme_inner.y,
+                    extreme_inner_dist_px=edge.extreme_inner.dist_to_center,
+                    extreme_outer_x_px=edge.extreme_outer.x,
+                    extreme_outer_y=edge.extreme_outer.y,
+                    extreme_outer_dist_px=edge.extreme_outer.dist_to_center,
+                    inner_z_score=inner_z,
+                    outer_z_score=outer_z,
+                )
+            )
+
+    df_lines = pd.DataFrame(line_records)
+    df_edges = pd.DataFrame(edge_records)
+
+    if pixel_size_nm is not None:
+        px_to_nm = float(pixel_size_nm)
+        # Line-level conversions
+        df_lines["center_sigma_nm"] = df_lines["center_sigma_px"] * px_to_nm
+        df_lines["width_mean_nm"] = df_lines["width_mean_px"] * px_to_nm
+        df_lines["width_sigma_nm"] = df_lines["width_sigma_px"] * px_to_nm
+
+        # Edge-level conversions for key distance columns
+        for col in ["ler_sigma_px", "mean_dist_to_center_px", "extreme_inner_dist_px", "extreme_outer_dist_px"]:
+            if col in df_edges.columns:
+                df_edges[col.replace("_px", "_nm")] = df_edges[col] * px_to_nm
+
+    return df_lines, df_edges
+
+
+def hist_with_annotations(
+    ax: plt.Axes,
+    data: np.ndarray,
+    num_bins: int,
+    xlabel: str,
+    title: str,
+) -> None:
+    """Helper: 1D histogram + mean and 95th percentile markers."""
+    data = np.asarray(data)
+    data = data[np.isfinite(data)]
+    if data.size == 0:
+        ax.set_title(title + " (no data)")
+        ax.set_xlabel(xlabel)
+        return
+
+    ax.hist(data, bins=num_bins, edgecolor="black", alpha=0.8)
+    ax.set_xlabel(xlabel)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+
+    mean_val = float(np.mean(data))
+    p95_val = float(np.quantile(data, 0.95))
+
+    ax.axvline(mean_val, linestyle="--", linewidth=2, label=f"mean = {mean_val:.3g}")
+    ax.axvline(p95_val, linestyle=":", linewidth=2, label=f"95th pct = {p95_val:.3g}")
+    ax.legend(fontsize=7)
+
+
+def analyze_global_roughness_to_fig(
+    line_stats_list: List[LineRoughnessStats],
+    pixel_size_nm: Optional[float] = None,
+    num_bins: int = 20,
+    figsize: Tuple[int, int] = (14, 10),
+) -> Tuple[pd.DataFrame, pd.DataFrame, str, plt.Figure]:
+    """
+    Build global roughness histograms + a compact text report.
+    """
+    df_lines, df_edges = build_roughness_dfs(line_stats_list, pixel_size_nm)
+
+    fig, axes = plt.subplots(2, 3, figsize=figsize)
+    axes = axes.ravel()
+
+    hist_with_annotations(
+        axes[0],
+        df_lines["center_sigma_px"].values,
+        num_bins,
+        "Centerline σ [px]",
+        "Centerline wandering (per line)",
+    )
+    hist_with_annotations(
+        axes[1],
+        df_lines["width_sigma_px"].values,
+        num_bins,
+        "CD σ [px]",
+        "CD roughness (per line)",
+    )
+    hist_with_annotations(
+        axes[2],
+        df_edges["ler_sigma_px"].values,
+        num_bins,
+        "LER σ [px]",
+        "Edge LER (all edges)",
+    )
+
+    inner_z = df_edges["inner_z_score"].values
+    hist_with_annotations(
+        axes[3],
+        inner_z,
+        num_bins,
+        "Inner extreme z-score",
+        "Inner excursions (bridge candidates)",
+    )
+    outer_z = df_edges["outer_z_score"].values
+    hist_with_annotations(
+        axes[4],
+        outer_z,
+        num_bins,
+        "Outer extreme z-score",
+        "Outer excursions (open candidates)",
+    )
+
+    hist_with_annotations(
+        axes[5],
+        df_lines["width_mean_px"].values,
+        num_bins,
+        "Mean CD [px]",
+        "Mean CD across lines",
+    )
+
+    fig.suptitle("Global line-edge roughness statistics", fontsize=14)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+    n_lines = len(df_lines)
+    n_edges = len(df_edges)
+    unit = "px"
+
+    center_sigma_mean = float(df_lines["center_sigma_px"].mean())
+    width_sigma_mean = float(df_lines["width_sigma_px"].mean())
+    ler_sigma_mean = float(df_edges["ler_sigma_px"].mean())
+
+    lines = [
+        "Global line-edge roughness summary",
+        "---------------------------------",
+        f"Number of line segments : {n_lines}",
+        f"Number of edges         : {n_edges}",
+        "",
+        f"Centerline wandering σ (mean over lines) : {center_sigma_mean:.3g} {unit}",
+        f"CD roughness σ (mean over lines)         : {width_sigma_mean:.3g} {unit}",
+        f"Edge LER σ (mean over edges)             : {ler_sigma_mean:.3g} {unit}",
+    ]
+    report_text = "\n".join(lines)
+
+    return df_lines, df_edges, report_text, fig
+
+
+# -------------------------------------------------------------------------
+# Step 4: Bridge / almost-bridge detection between neighboring lines
+# -------------------------------------------------------------------------
+
+
+def detect_bridge_anomalies(
+    line_stats_list: List[LineRoughnessStats],
+    sensitivity: str = "medium",
+    z_threshold_global: Optional[float] = None,
+    z_threshold_pair: Optional[float] = None,
+    quantile_threshold: Optional[float] = None,
+    min_run_length: int = 2,
+) -> List[BridgeAnomaly]:
+    """
+    Detect bridge / almost-bridge candidates by analyzing gaps between
+    neighboring lines (distance between right edge of line i and left
+    edge of line i+1 at each row y).
+
+    - We compute global robust statistics of gaps across all pairs.
+    - For each pair, we also compute robust stats for that pair.
+    - A "candidate" row is where:
+        * gap > 0 (no overlap)
+        * global z-score is very negative (much smaller than global median gap)
+        * pair z-score is also very negative (much smaller than that pair's median gap)
+        * gap is below a global quantile (e.g., q = 3% or 5%)
+    - Consecutive candidate rows (y increasing by 1) form a vertical run;
+      only runs of length ≥ min_run_length are reported, and each run
+      is summarized at the row with minimal gap.
+    """
+    if len(line_stats_list) < 2:
+        return []
+
+    # Sort lines left-to-right by centerline x
+    sorted_lines = sorted(line_stats_list, key=lambda ln: ln.center_mean_x)
+
+    pair_infos: List[Dict] = []
+    all_gaps: List[np.ndarray] = []
+
+    # Gather per-pair gap statistics
+    for idx in range(len(sorted_lines) - 1):
+        left_line = sorted_lines[idx]
+        right_line = sorted_lines[idx + 1]
+
+        y_left = left_line.right_edge.y
+        x_right_left = left_line.right_edge.x
+
+        y_right = right_line.left_edge.y
+        x_left_right = right_line.left_edge.x
+
+        common_y, idx_l, idx_r = np.intersect1d(y_left, y_right, return_indices=True)
+        if common_y.size == 0:
+            continue
+
+        x_r = x_right_left[idx_l].astype(float)
+        x_l = x_left_right[idx_r].astype(float)
+        gaps = x_l - x_r  # positive gap = space between lines
+
+        pair_infos.append(
+            dict(
+                left_line_id=left_line.label_id,
+                right_line_id=right_line.label_id,
+                y=common_y.astype(int),
+                x_left=x_l,
+                x_right=x_r,
+                gap=gaps,
+            )
+        )
+        all_gaps.append(gaps)
+
+    if not all_gaps:
+        return []
+
+    all_gaps_arr = np.concatenate(all_gaps)
+
+    def robust_loc_scale(values: np.ndarray, eps: float = 1e-12) -> Tuple[float, float]:
+        values = np.asarray(values)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            return 0.0, eps
+        med = float(np.median(values))
+        mad = float(np.median(np.abs(values - med)))
+        sigma = 1.4826 * mad
+        if sigma < eps:
+            sigma = eps
+        return med, sigma
+
+    global_med, global_sigma = robust_loc_scale(all_gaps_arr)
+
+    def resolve_sensitivity(
+        sens: str,
+        zg: Optional[float] = None,
+        zp: Optional[float] = None,
+        q: Optional[float] = None,
+    ) -> Tuple[float, float, float]:
+        if sens == "low":
+            zg0, zp0, q0 = 4.0, 3.5, 0.01
+        elif sens == "medium":
+            zg0, zp0, q0 = 3.0, 2.7, 0.03
+        elif sens == "high":
+            zg0, zp0, q0 = 2.5, 2.2, 0.05
+        else:
+            raise ValueError(f"Unknown sensitivity level '{sens}'")
+
+        if zg is None:
+            zg = zg0
+        if zp is None:
+            zp = zp0
+        if q is None:
+            q = q0
+        if not (0.0 < q < 0.5):
+            raise ValueError("quantile_threshold must be in (0, 0.5)")
+
+        return float(zg), float(zp), float(q)
+
+    zg_thr, zp_thr, q_thr = resolve_sensitivity(
+        sensitivity, z_threshold_global, z_threshold_pair, quantile_threshold
+    )
+    global_q_value = float(np.quantile(all_gaps_arr, q_thr))
+
+    anomalies: List[BridgeAnomaly] = []
+
+    for info in pair_infos:
+        gaps = info["gap"]
+        y = info["y"]
+        x_l = info["x_left"]
+        x_r = info["x_right"]
+
+        if gaps.size == 0:
+            continue
+
+        pair_med, pair_sigma = robust_loc_scale(gaps)
+
+        z_global = (gaps - global_med) / global_sigma
+        z_pair = (gaps - pair_med) / pair_sigma
+
+        is_candidate = (
+            (gaps > 0.0)
+            & (z_global < -zg_thr)
+            & (z_pair < -zp_thr)
+            & (gaps < global_q_value)
+        )
+
+        candidate_idx = np.where(is_candidate)[0]
+        if candidate_idx.size == 0:
+            continue
+
+        # Group consecutive rows into runs
+        start = 0
+        for i in range(1, len(candidate_idx) + 1):
+            # End of a run if:
+            # - we reached the end of candidate_idx
+            # - OR the next index is not y+1
+            at_run_end = (
+                i == len(candidate_idx)
+                or candidate_idx[i] != candidate_idx[i - 1] + 1
+                or y[candidate_idx[i]] != y[candidate_idx[i - 1]] + 1
+            )
+            if at_run_end:
+                run = candidate_idx[start:i]
+                if run.size >= min_run_length:
+                    run_gaps = gaps[run]
+                    local_min_pos = run[int(np.argmin(run_gaps))]
+
+                    gap_min = float(gaps[local_min_pos])
+                    y_min = int(y[local_min_pos])
+                    x_center = 0.5 * (x_l[local_min_pos] + x_r[local_min_pos])
+
+                    anomalies.append(
+                        BridgeAnomaly(
+                            left_line_id=int(info["left_line_id"]),
+                            right_line_id=int(info["right_line_id"]),
+                            x_center_px=float(x_center),
+                            y_px=y_min,
+                            gap_px=gap_min,
+                            z_global=float(z_global[local_min_pos]),
+                            z_pair=float(z_pair[local_min_pos]),
+                        )
+                    )
+
+                start = i
+
+    logger.info("Detected %d bridge / almost-bridge candidates.", len(anomalies))
+    return anomalies
+
+
+def bridge_anomalies_to_dataframe(anomalies: List[BridgeAnomaly]) -> pd.DataFrame:
+    """Convert bridge anomalies to a flat table."""
+    if not anomalies:
+        return pd.DataFrame(
+            columns=[
+                "left_line_id",
+                "right_line_id",
+                "x_center_px",
+                "y_px",
+                "gap_px",
+                "z_global",
+                "z_pair",
+            ]
+        )
+
+    records = []
+    for a in anomalies:
+        records.append(
+            dict(
+                left_line_id=a.left_line_id,
+                right_line_id=a.right_line_id,
+                x_center_px=a.x_center_px,
+                y_px=a.y_px,
+                gap_px=a.gap_px,
+                z_global=a.z_global,
+                z_pair=a.z_pair,
+            )
+        )
+    return pd.DataFrame.from_records(records)
+
+
+# -------------------------------------------------------------------------
+# Step 5: Visualization helpers
+# -------------------------------------------------------------------------
+
+
+def overlay_ground_truth_boundaries(
+    ax: plt.Axes,
+    ground_truth_mask: np.ndarray,
+    class_color_map: Optional[Dict[int, str]] = None,
+) -> None:
+    """
+    Overlay ground-truth labeled regions as colored contours.
+
+    ground_truth_mask: 2D integer array (0=background, >0 class labels).
+    """
+    gt = np.asarray(ground_truth_mask)
+    if gt.ndim != 2:
+        raise ValueError("Ground-truth mask must be 2D.")
+    classes = np.unique(gt[gt > 0])
+    if classes.size == 0:
+        return
+
+    if class_color_map is None:
+        base_colors = [
+            "red",
+            "lime",
+            "cyan",
+            "yellow",
+            "magenta",
+            "orange",
+            "deepskyblue",
+            "white",
+        ]
+        class_color_map = {
+            int(cls): base_colors[i % len(base_colors)] for i, cls in enumerate(classes)
+        }
+
+    for cls in classes:
+        cls = int(cls)
+        cls_mask = (gt == cls).astype(float)
+        ax.contour(
+            cls_mask,
+            levels=[0.5],
+            colors=[class_color_map[cls]],
+            linewidths=2.0,
+            origin="upper",
+        )
+
+
+def create_segmentation_debug_figure(
+    image: np.ndarray,
+    segmentation: np.ndarray,
+    projection: np.ndarray,
+    threshold: float,
+    ground_truth_mask: Optional[np.ndarray] = None,
+) -> plt.Figure:
+    """
+    Two-panel debug view:
+
+    - Top: ROI with segmentation contour (and optional GT overlay)
+    - Bottom: 1D x-projection and Otsu threshold
+    """
+    img = np.asarray(image)
+    seg = np.asarray(segmentation, dtype=bool)
+
+    h, w = img.shape
+    fig, axes = plt.subplots(2, 1, figsize=(8, 8))
+    ax0, ax1 = axes
+
+    # Top: image + segmentation + optional GT
+    ax0.imshow(img, cmap="gray", origin="upper")
+    ax0.set_title("Selected channel (ROI) with segmentation")
+    ax0.set_axis_off()
+    ax0.contour(seg.astype(float), levels=[0.5], colors=["cyan"], linewidths=0.8)
+
+    if ground_truth_mask is not None:
+        overlay_ground_truth_boundaries(ax0, ground_truth_mask)
+
+    # Bottom: 1D projection and threshold
+    x = np.arange(w)
+    ax1.plot(x, projection, label="Mean GL along x")
+    ax1.axhline(
+        threshold,
+        linestyle="--",
+        linewidth=2,
+        label=f"Otsu threshold = {threshold:.3g}",
+    )
+    ax1.set_xlabel("x [px]")
+    ax1.set_ylabel("Mean intensity")
+    ax1.set_title("1D x-projection and Otsu threshold")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+
+    fig.tight_layout()
+    return fig
+
+
+def create_line_roughness_overlay_figure(
+    image: np.ndarray,
+    segmentation: np.ndarray,
+    line_stats_list: List[LineRoughnessStats],
+    ground_truth_mask: Optional[np.ndarray] = None,
+    anomalies: Optional[List[BridgeAnomaly]] = None,
+    show_segmentation_contour: bool = True,
+    title: Optional[str] = None,
+) -> plt.Figure:
+    """
+    Main per-line visualization:
+
+    - Grayscale ROI
+    - Optional segmentation contour (all lines)
+    - For each line:
+        * vertical CI band (x_low, x_high) for left & right edges
+        * center of CI marked with cyan dashed line
+        * inner & outer extreme points (yellow dots)
+    - Optional:
+        * ground-truth contours
+        * bridge / almost-bridge anomalies (red 'x')
+    """
+    img = np.asarray(image)
+    seg = np.asarray(segmentation, dtype=bool)
+
+    h, w = img.shape
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.imshow(img, cmap="gray", interpolation="nearest", origin="upper")
+    ax.set_xlim(0, w)
+    ax.set_ylim(h, 0)
+    ax.set_xlabel("x [px]")
+    ax.set_ylabel("y [px]")
+
+    if title:
+        ax.set_title(title)
+
+    # Optional segmentation contour
+    if show_segmentation_contour:
+        ax.contour(seg.astype(float), levels=[0.5], colors=["lime"], linewidths=0.7)
+
+    # Draw per-line CI bands and extremes
+    for line_stats in line_stats_list:
+        y_min = int(np.min(line_stats.y))
+        y_max = int(np.max(line_stats.y))
+
+        def draw_edge(edge_stats: EdgeSideStats) -> None:
+            ci_low_x = edge_stats.ci_low_x
+            ci_high_x = edge_stats.ci_high_x
+            ci_center_x = 0.5 * (ci_low_x + ci_high_x)
+
+            # CI boundaries (outer band)
+            ax.vlines(
+                [ci_low_x, ci_high_x],
+                ymin=y_min,
+                ymax=y_max,
+                colors="magenta",
+                linestyles="dashed",
+                linewidth=1.3,
+                alpha=0.9,
+            )
+
+            # Center of CI
+            ax.vlines(
+                ci_center_x,
+                ymin=y_min,
+                ymax=y_max,
+                colors="cyan",
+                linestyles="dashed",
+                linewidth=1.6,
+                alpha=0.9,
+            )
+
+            # Inner / outer extremes
+            for extreme in (edge_stats.extreme_inner, edge_stats.extreme_outer):
+                ax.scatter(
+                    extreme.x,
+                    extreme.y,
+                    s=50,
+                    c="yellow",
+                    edgecolors="black",
+                    linewidths=0.7,
+                    zorder=5,
+                )
+
+        draw_edge(line_stats.left_edge)
+        draw_edge(line_stats.right_edge)
+
+    # Optional bridge anomalies as red 'x'
+    if anomalies:
+        for a in anomalies:
+            ax.scatter(
+                a.x_center_px,
+                a.y_px,
+                s=80,
+                marker="x",
+                c="red",
+                linewidths=2.0,
+                zorder=6,
+            )
+
+    # Optional ground-truth overlay
+    if ground_truth_mask is not None:
+        overlay_ground_truth_boundaries(ax, ground_truth_mask)
+
+    ax.set_aspect("equal")
+    ax.grid(False)
+    fig.tight_layout()
+    return fig
+
+
+# -------------------------------------------------------------------------
+# Streamlit UI
+# -------------------------------------------------------------------------
+
+
+def _init_session_state() -> None:
+    """Initialize Streamlit session_state with default keys."""
+    defaults = {
+        "image_name": None,
+        "image_channels": None,  # (C, H, W)
+        "mask_name": None,
+        "mask_array": None,  # full GT mask
+        "selected_channel": 0,
+        "roi_image": None,  # 2D float ROI
+        "roi_mask": None,  # 2D mask ROI
+        "segmentation": None,
+        "seg_projection": None,
+        "seg_threshold": None,
+        "line_stats_list": None,
+        "df_lines": None,
+        "df_edges": None,
+        "roughness_report": None,
+        "bridge_anomalies": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title="Line Roughness & Bridge-Detection Toolkit",
+        layout="wide",
+    )
+    st.title("Line Roughness & Bridge-Detection Toolkit")
+
+    _init_session_state()
+
+    # ---------------------------------------------------------------------
+    # Sidebar: inputs and configuration
+    # ---------------------------------------------------------------------
+    st.sidebar.header("Inputs")
+
+    uploaded_image = st.sidebar.file_uploader(
+        "Upload SEM image (multi-channel TIFF or grayscale)",
+        type=["tif", "tiff", "png", "jpg", "jpeg", "bmp"],
+    )
+
+    uploaded_mask = st.sidebar.file_uploader(
+        "Upload ground-truth mask (optional)",
+        type=["tif", "tiff", "png", "jpg", "jpeg", "bmp"],
+    )
+
+    nm_per_pixel = st.sidebar.number_input(
+        "Scale (nm per pixel)",
+        min_value=0.01,
+        max_value=100.0,
+        value=1.0,
+        step=0.01,
+        help="Use microscope calibration / scale bar.",
+    )
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("ROI cropping (pixels)")
+
+    crop_top = st.sidebar.number_input("Crop top", min_value=0, value=0)
+    crop_bottom = st.sidebar.number_input("Crop bottom", min_value=0, value=0)
+    crop_left = st.sidebar.number_input("Crop left", min_value=0, value=0)
+    crop_right = st.sidebar.number_input("Crop right", min_value=0, value=0)
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Bridge detection parameters")
+
+    sensitivity_choice = st.sidebar.selectbox(
+        "Bridge detection sensitivity",
+        options=["low", "medium", "high"],
+        index=1,
+        help="Higher sensitivity = more detections (looser thresholds).",
+    )
+
+    min_run_length = st.sidebar.number_input(
+        "Min. vertical run length [pixels]",
+        min_value=1,
+        max_value=20,
+        value=2,
+        help="Require at least this many consecutive rows for a bridge candidate.",
+    )
+
+    run_button = st.sidebar.button(
+        "Run full analysis",
+        disabled=(uploaded_image is None),
+    )
+
+    # ---------------------------------------------------------------------
+    # If no image yet, show hint and stop
+    # ---------------------------------------------------------------------
+    if uploaded_image is None:
+        st.info("Upload a SEM image to begin.")
+        return
+
+    # ---------------------------------------------------------------------
+    # Load image (once per filename) and optional mask
+    # ---------------------------------------------------------------------
+    if st.session_state["image_name"] != uploaded_image.name:
+        try:
+            channels = load_sem_image_multichannel(uploaded_image)
+        except Exception as exc:
+            st.error(f"Failed to load image: {exc}")
+            return
+
+        st.session_state["image_name"] = uploaded_image.name
+        st.session_state["image_channels"] = channels
+        st.session_state["selected_channel"] = 0
+
+        # Reset all downstream state whenever a new image is loaded
+        for key in [
+            "roi_image",
+            "roi_mask",
+            "segmentation",
+            "seg_projection",
+            "seg_threshold",
+            "line_stats_list",
+            "df_lines",
+            "df_edges",
+            "roughness_report",
+            "bridge_anomalies",
+        ]:
+            st.session_state[key] = None
+
+    if uploaded_mask is not None and st.session_state["mask_name"] != uploaded_mask.name:
+        try:
+            mask_arr = load_ground_truth_mask(uploaded_mask)
+        except Exception as exc:
+            st.error(f"Failed to load ground-truth mask: {exc}")
+            mask_arr = None
+
+        st.session_state["mask_name"] = uploaded_mask.name
+        st.session_state["mask_array"] = mask_arr
+
+    # ---------------------------------------------------------------------
+    # Channel selection
+    # ---------------------------------------------------------------------
+    image_channels = st.session_state["image_channels"]
+    if image_channels is None:
+        st.error("Internal error: image not loaded correctly.")
+        return
+
+    num_channels = int(image_channels.shape[0])
+
+    st.sidebar.subheader("Channel selection")
+    channel_index = st.sidebar.number_input(
+        "Channel to analyze (0-based index)",
+        min_value=0,
+        max_value=num_channels - 1,
+        value=int(st.session_state["selected_channel"]),
+        step=1,
+    )
+    channel_index = int(channel_index)
+
+    if channel_index != st.session_state["selected_channel"]:
+        st.session_state["selected_channel"] = channel_index
+        # Reset downstream state on channel change
+        for key in [
+            "roi_image",
+            "roi_mask",
+            "segmentation",
+            "seg_projection",
+            "seg_threshold",
+            "line_stats_list",
+            "df_lines",
+            "df_edges",
+            "roughness_report",
+            "bridge_anomalies",
+        ]:
+            st.session_state[key] = None
+
+    # ---------------------------------------------------------------------
+    # Build ROI for selected channel (and corresponding mask ROI)
+    # ---------------------------------------------------------------------
+    channel_image = image_channels[st.session_state["selected_channel"]]
+    roi_image = crop_image_numeric_2d(
+        channel_image, crop_top, crop_bottom, crop_left, crop_right
+    )
+    st.session_state["roi_image"] = roi_image
+
+    roi_mask = None
+    if st.session_state["mask_array"] is not None:
+        full_mask = st.session_state["mask_array"]
+        if full_mask.shape != channel_image.shape:
+            st.warning(
+                "Ground-truth mask size does not match image size; "
+                "mask overlay is disabled for this view."
+            )
+            roi_mask = None
+        else:
+            roi_mask = crop_image_numeric_2d(
+                full_mask, crop_top, crop_bottom, crop_left, crop_right
+            )
+    st.session_state["roi_mask"] = roi_mask
+
+    # ---------------------------------------------------------------------
+    # Show basic info and ROI
+    # ---------------------------------------------------------------------
+    defect_id = extract_defect_id_from_filename(st.session_state["image_name"])
+    st.markdown(f"**Defect ID (parsed from filename):** `{defect_id}`")
+    st.markdown(f"**Number of channels in image:** {num_channels}")
+    st.markdown(f"**Current channel index:** {st.session_state['selected_channel']}")
+
+    st.subheader("Selected channel (after cropping)")
+    st.image(roi_image, clamp=True, channels="GRAY")
+
+    if not run_button:
+        # Stop here; user can inspect the raw ROI and adjust parameters
+        st.stop()
+
+    # ---------------------------------------------------------------------
+    # Run full analysis pipeline
+    # ---------------------------------------------------------------------
+    with st.spinner("Running segmentation, roughness analysis, and bridge detection..."):
+        try:
+            seg, thr, proj = segment_lines_otsu_x_projection(roi_image)
+            line_stats_list = measure_line_roughness(seg)
+            df_lines, df_edges, roughness_report, global_fig = analyze_global_roughness_to_fig(
+                line_stats_list,
+                pixel_size_nm=nm_per_pixel,
+            )
+            bridge_anomalies = detect_bridge_anomalies(
+                line_stats_list,
+                sensitivity=sensitivity_choice,
+                min_run_length=int(min_run_length),
+            )
+        except Exception as exc:
+            st.error(f"Analysis failed: {exc}")
+            logger.exception("Analysis failed.")
+            return
+
+        # Persist results in session_state
+        st.session_state["segmentation"] = seg
+        st.session_state["seg_projection"] = proj
+        st.session_state["seg_threshold"] = thr
+        st.session_state["line_stats_list"] = line_stats_list
+        st.session_state["df_lines"] = df_lines
+        st.session_state["df_edges"] = df_edges
+        st.session_state["roughness_report"] = roughness_report
+        st.session_state["bridge_anomalies"] = bridge_anomalies
+
+    st.success("Analysis completed.")
+
+    anomalies_df = bridge_anomalies_to_dataframe(
+        st.session_state["bridge_anomalies"]
+    )
+
+    # ---------------------------------------------------------------------
+    # Tabs: visualization and exports
+    # ---------------------------------------------------------------------
+    (
+        tab_seg,
+        tab_roughness,
+        tab_global,
+        tab_bridge,
+        tab_tables,
+    ) = st.tabs(
+        [
+            "Segmentation debug",
+            "Line roughness overlay",
+            "Global roughness histograms",
+            "Bridge / almost-bridge overlay",
+            "Data tables & export",
+        ]
+    )
+
+    with tab_seg:
+        st.subheader("Segmentation (Otsu on x-projection)")
+        fig_seg = create_segmentation_debug_figure(
+            st.session_state["roi_image"],
+            st.session_state["segmentation"],
+            st.session_state["seg_projection"],
+            st.session_state["seg_threshold"],
+            ground_truth_mask=st.session_state["roi_mask"],
+        )
+        st.pyplot(fig_seg, clear_figure=True)
+
+    with tab_roughness:
+        st.subheader("Line roughness overlay")
+        fig_rough = create_line_roughness_overlay_figure(
+            st.session_state["roi_image"],
+            st.session_state["segmentation"],
+            st.session_state["line_stats_list"],
+            ground_truth_mask=st.session_state["roi_mask"],
+            anomalies=None,
+            title="Line roughness: CI bands & extreme points",
+        )
+        st.pyplot(fig_rough, clear_figure=True)
+
+    with tab_global:
+        st.subheader("Global roughness statistics")
+        st.pyplot(global_fig, clear_figure=True)
+        st.text(st.session_state["roughness_report"])
+
+    with tab_bridge:
+        st.subheader("Bridge / almost-bridge candidates")
+        if st.session_state["bridge_anomalies"]:
+            fig_bridge = create_line_roughness_overlay_figure(
+                st.session_state["roi_image"],
+                st.session_state["segmentation"],
+                st.session_state["line_stats_list"],
+                ground_truth_mask=st.session_state["roi_mask"],
+                anomalies=st.session_state["bridge_anomalies"],
+                title="Bridge / almost-bridge overlay",
+            )
+            st.pyplot(fig_bridge, clear_figure=True)
+
+            st.markdown("**Bridge candidates table**")
+            st.dataframe(anomalies_df, use_container_width=True)
+        else:
+            st.info(
+                "No bridge / almost-bridge candidates detected "
+                "for the current sensitivity and run-length settings."
+            )
+
+    with tab_tables:
+        st.subheader("Per-line summary")
+        st.dataframe(st.session_state["df_lines"], use_container_width=True)
+
+        st.subheader("Per-edge summary")
+        st.dataframe(st.session_state["df_edges"], use_container_width=True)
+
+        if not anomalies_df.empty:
+            st.subheader("Bridge candidates")
+            st.dataframe(anomalies_df, use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("Download CSV / Parquet")
+
+        # Line-level summary
+        csv_lines = st.session_state["df_lines"].to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="Download line-level CSV",
+            data=csv_lines,
+            file_name="line_roughness_summary.csv",
+            mime="text/csv",
+        )
+
+        parquet_buffer_lines = io.BytesIO()
+        st.session_state["df_lines"].to_parquet(parquet_buffer_lines, index=False)
+        parquet_buffer_lines.seek(0)
+        st.download_button(
+            label="Download line-level Parquet",
+            data=parquet_buffer_lines,
+            file_name="line_roughness_summary.parquet",
+            mime="application/octet-stream",
+        )
+
+        # Edge-level summary
+        csv_edges = st.session_state["df_edges"].to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="Download edge-level CSV",
+            data=csv_edges,
+            file_name="edge_roughness_summary.csv",
+            mime="text/csv",
+        )
+
+        parquet_buffer_edges = io.BytesIO()
+        st.session_state["df_edges"].to_parquet(parquet_buffer_edges, index=False)
+        parquet_buffer_edges.seek(0)
+        st.download_button(
+            label="Download edge-level Parquet",
+            data=parquet_buffer_edges,
+            file_name="edge_roughness_summary.parquet",
+            mime="application/octet-stream",
+        )
+
+        # Bridge candidates (if any)
+        if not anomalies_df.empty:
+            csv_anoms = anomalies_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="Download bridge candidates CSV",
+                data=csv_anoms,
+                file_name="bridge_candidates.csv",
+                mime="text/csv",
+            )
+
+            parquet_buffer_anoms = io.BytesIO()
+            anomalies_df.to_parquet(parquet_buffer_anoms, index=False)
+            parquet_buffer_anoms.seek(0)
+            st.download_button(
+                label="Download bridge candidates Parquet",
+                data=parquet_buffer_anoms,
+                file_name="bridge_candidates.parquet",
+                mime="application/octet-stream",
+            )
+
+
+if __name__ == "__main__":
+    main()
