@@ -1,0 +1,286 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+from scipy.signal import detrend
+from skimage.util import img_as_float
+from skimage.registration import phase_cross_correlation
+from skimage.transform import AffineTransform, warp, rotate, radon, rescale
+from dataclasses import dataclass
+
+
+@dataclass
+class CellGrid:
+    unit_cell: np.ndarray
+    quality_map: np.ndarray
+
+
+class SEMLatticePipeline:
+    def __init__(self,
+                 approx_period_range=(10, 100),
+                 max_instances_y=None,
+                 max_instances_x=None,
+                 padding_ratio=0.5):
+        """
+        Parameters:
+        - approx_period_range: (min_pixels, max_pixels) manual search range.
+        - max_instances_y: Maximum expected number of cells vertically.
+                           Used to filter out high-frequency harmonics.
+                           If set, overrides the 'min' in approx_period_range for Y.
+        - max_instances_x: Maximum expected number of cells horizontally.
+                           If set, overrides the 'min' in approx_period_range for X.
+        - padding_ratio: Extra area to extract around the estimated cell size.
+        """
+        self.min_p_manual, self.max_p_manual = approx_period_range
+        self.max_instances_y = max_instances_y
+        self.max_instances_x = max_instances_x
+        self.pad_ratio = padding_ratio
+        self.grid_shape = (0, 0)
+
+    def run(self, image: np.ndarray):
+        img = img_as_float(image)
+
+        # 1. Deskew
+        img_rot, angle = self._auto_deskew(img)
+        print(f"Deskew Angle: {angle:.2f} degrees")
+
+        # 2. Estimate Period (Harmonic Filtering applied here)
+        py, px = self._estimate_periods(img_rot)
+        print(f"Estimated Periods: Y={py:.1f}, X={px:.1f}")
+
+        # 3. Extract Initial Grid (Robust at Edges)
+        cell_h, cell_w = int(np.round(py)), int(np.round(px))
+        pad_h, pad_w = int(cell_h * self.pad_ratio), int(cell_w * self.pad_ratio)
+
+        # Use updated extraction that handles edges gracefully
+        _, raw_patches = self._extract_initial_grid(
+            img_rot, py, px, cell_h, cell_w, pad_h, pad_w
+        )
+
+        # 4. PASS 1: Neighbor Alignment (Rough)
+        print("Pass 1: Neighbor alignment...")
+        rough_aligned, _ = self._align_via_neighbors(
+            raw_patches, (cell_h, cell_w)
+        )
+
+        # 5. PASS 2: Template Refinement
+        print("Pass 2: Global Template Refinement...")
+        valid_patches = [p for p in rough_aligned if np.any(p)]
+        if not valid_patches:
+            raise ValueError("No valid patches found.")
+
+        master_template = np.median(valid_patches, axis=0)
+
+        final_aligned = self._refine_with_template(
+            raw_patches, master_template, (cell_h, cell_w)
+        )
+
+        result = CellGrid(
+            unit_cell=np.mean(final_aligned, axis=0),
+            quality_map=np.var(final_aligned, axis=0)
+        )
+
+        return result, final_aligned
+
+    def _estimate_periods(self, img):
+        """
+        Estimates period using FFT.
+        If max_instances_* is set, it dynamically calculates the minimum allowed period
+        to filter out higher harmonics (smaller periods).
+        """
+        h, w = img.shape
+
+        # --- Dynamic Range Calculation ---
+        # If user specified max instances, the period cannot be smaller than (ImageSize / MaxInstances)
+
+        # Y-Axis Logic
+        if self.max_instances_y is not None:
+            # Allow a small buffer (e.g. 0.8) in case the count isn't exact or there's padding
+            min_p_y = (h / (self.max_instances_y + 1))
+            print(
+                f"DEBUG: Filtering Y harmonics. Min period set to {min_p_y:.1f}px (Max {self.max_instances_y} instances)")
+        else:
+            min_p_y = self.min_p_manual
+
+        # X-Axis Logic
+        if self.max_instances_x is not None:
+            min_p_x = (w / (self.max_instances_x + 1))
+            print(
+                f"DEBUG: Filtering X harmonics. Min period set to {min_p_x:.1f}px (Max {self.max_instances_x} instances)")
+        else:
+            min_p_x = self.min_p_manual
+
+        # Helper to run FFT with specific range
+        def get_p_1d(prof, min_p_limit, axis_len):
+            prof = detrend(prof)
+            # Use Hanning window to reduce spectral leakage
+            fft = np.abs(np.fft.rfft(prof * np.hanning(len(prof)))) ** 2
+            freqs = np.fft.rfftfreq(len(prof))
+
+            # Mask frequencies:
+            # 1. Must be lower than 1/min_p (Period > min_p)
+            # 2. Must be higher than 1/max_p (Period < max_p)
+            # Note: We keep the manual max_p to avoid DC offset/low freq noise
+            mask = (freqs > 1 / self.max_p_manual) & (freqs < 1 / min_p_limit)
+
+            if not np.any(mask):
+                return 40.0  # Fallback
+
+            # Find peak in the masked region
+            best_freq = freqs[mask][np.argmax(fft[mask])]
+            return 1.0 / best_freq
+
+        # Profile means
+        prof_y = np.mean(img, axis=1)
+        prof_x = np.mean(img, axis=0)
+
+        per_y = get_p_1d(prof_y, min_p_y, h)
+        per_x = get_p_1d(prof_x, min_p_x, w)
+
+        return per_y, per_x
+
+    def _safe_extract(self, img, y, x, h, w):
+        img_h, img_w = img.shape
+        half_h, half_w = h // 2, w // 2
+
+        y_start, y_end = int(y - half_h), int(y - half_h + h)
+        x_start, x_end = int(x - half_w), int(x - half_w + w)
+
+        y_s_clip = max(0, y_start)
+        y_e_clip = min(img_h, y_end)
+        x_s_clip = max(0, x_start)
+        x_e_clip = min(img_w, x_end)
+
+        if y_s_clip >= y_e_clip or x_s_clip >= x_e_clip:
+            return np.zeros((h, w))
+
+        valid_patch = img[y_s_clip:y_e_clip, x_s_clip:x_e_clip]
+
+        pad_top = y_s_clip - y_start
+        pad_bot = y_end - y_e_clip
+        pad_left = x_s_clip - x_start
+        pad_right = x_end - x_e_clip
+
+        if pad_top > 0 or pad_bot > 0 or pad_left > 0 or pad_right > 0:
+            return np.pad(valid_patch, ((pad_top, pad_bot), (pad_left, pad_right)), mode='reflect')
+
+        return valid_patch
+
+    def _extract_initial_grid(self, img, py, px, h, w, ph, pw):
+        Ny, Nx = int(img.shape[0] / py) - 1, int(img.shape[1] / px) - 1
+        self.grid_shape = (Ny, Nx)
+
+        patches = np.full((Ny, Nx), None, dtype=object)
+        full_h = h + 2 * ph
+        full_w = w + 2 * pw
+
+        for r in range(Ny):
+            for c in range(Nx):
+                cy, cx = (r * py + py / 2), (c * px + px / 2)
+                patches[r, c] = self._safe_extract(img, cy, cx, full_h, full_w)
+
+        return None, patches
+
+    def _refine_with_template(self, raw_grid, template, target_size):
+        Ny, Nx = raw_grid.shape
+        h, w = target_size
+        aligned_cells = []
+
+        for r in range(Ny):
+            for c in range(Nx):
+                curr = raw_grid[r, c]
+                if curr is None or not np.any(curr):
+                    aligned_cells.append(np.zeros((h, w)))
+                    continue
+
+                curr_h, curr_w = curr.shape
+                temp_h, temp_w = template.shape
+
+                pad_y = (curr_h - temp_h) // 2
+                pad_x = (curr_w - temp_w) // 2
+
+                template_padded = np.pad(
+                    template,
+                    ((pad_y, curr_h - temp_h - pad_y), (pad_x, curr_w - temp_w - pad_x)),
+                    mode='constant'
+                )
+
+                shift_vec, error, _ = phase_cross_correlation(
+                    template_padded, curr, upsample_factor=10
+                )
+
+                tform = AffineTransform(translation=shift_vec)
+                warped = warp(curr, tform, mode='reflect')
+
+                cy, cx = curr.shape[0] // 2, curr.shape[1] // 2
+                sy, sx = cy - h // 2, cx - w // 2
+
+                cell = warped[sy:sy + h, sx:sx + w]
+                aligned_cells.append(cell)
+
+        return np.array(aligned_cells)
+
+    def _align_via_neighbors(self, raw_grid, size):
+        Ny, Nx = raw_grid.shape
+        h, w = size
+        aligned = []
+
+        for r in range(Ny):
+            for c in range(Nx):
+                curr = raw_grid[r, c]
+                cy, cx = curr.shape[0] // 2, curr.shape[1] // 2
+                cell = curr[cy - h // 2: cy + h // 2, cx - w // 2: cx + w // 2]
+                aligned.append(cell)
+        return np.array(aligned), None
+
+    def _auto_deskew(self, image):
+        small = rescale(image, 0.5, anti_aliasing=True)
+        angles = np.linspace(-5.0, 5.0, 40)
+        sinogram = radon(small, theta=angles, circle=False)
+        best_angle = angles[np.argmax(np.var(sinogram, axis=0))]
+        return (rotate(image, -best_angle, mode='reflect'), best_angle) if abs(best_angle) > 0.1 else (image, 0.0)
+
+
+def plot_all_aligned_cells(cell_list, grid_shape):
+    rows, cols = grid_shape
+    fig, axes = plt.subplots(rows, cols, figsize=(cols, rows), squeeze=False)
+    ax_flat = axes.flatten()
+    for i in range(len(ax_flat)):
+        if i < len(cell_list):
+            ax_flat[i].imshow(cell_list[i], cmap='gray')
+        ax_flat[i].axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
+# --- Execution Example ---
+if __name__ == "__main__":
+    try:
+        path = r'C:\Users\user\Downloads\Screenshot 2025-12-17 201334.png'
+        img = np.array(Image.open(path).convert('L'))
+
+        # --- USER SETTINGS ---
+        # Here you set the max instances to prevent picking up smaller harmonic periods.
+        # e.g., if you know there are roughly 3 rows, set max_instances_y=5 (safe upper bound)
+        # This will force the code to ignore any period smaller than ImageHeight / 5.
+
+        pipeline = SEMLatticePipeline(
+            approx_period_range=(10, 300),
+            max_instances_y=3,  # Limits search to periods > ImageHeight/10
+            max_instances_x=10  # Limits search to periods > ImageWidth/20
+        )
+
+        result, cells = pipeline.run(img)
+
+        # Plot
+        plt.figure()
+        plt.imshow(result.unit_cell, cmap='gray')
+        plt.title("Final Unit Cell")
+        plt.axis('off')
+        plt.show()
+
+        plot_all_aligned_cells(cells, pipeline.grid_shape)
+
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
