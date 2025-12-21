@@ -1,0 +1,113 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
+from skimage.measure import label, regionprops
+
+def refine_anomaly_ellipse(z_score_map, initial_yx, sigma_limit=3.0):
+    """
+    Refines an ellipse around a defect using Image Moments of the Z-Score map.
+    
+    1. Thresholds the Z-Map to find significant pixels (> 3 sigma).
+    2. Keeps only the blob closest to the user's initial click (Connected Components).
+    3. Calculates the Covariance Matrix of that blob.
+    4. Derives the Ellipse (Center, Width, Height, Angle) from the Eigenvalues.
+
+    Parameters:
+    -----------
+    z_score_map : np.ndarray
+        The (Patch - Mean) / Std map.
+    initial_yx : tuple (y, x)
+        The user's rough click or initial center.
+    sigma_limit : float
+        Threshold to define 'what is defect'. Default 3.0 (3 standard deviations).
+
+    Returns:
+    --------
+    params : tuple
+        (center_y, center_x, major_axis, minor_axis, angle_degrees)
+    """
+    
+    # 1. Thresholding: Isolate the "Defect Mass"
+    # We look for pixels that are statistically significant outliers
+    # We take absolute value because defects can be dark or bright
+    binary_mask = np.abs(z_score_map) > sigma_limit
+    
+    if np.sum(binary_mask) == 0:
+        print("Warning: No pixels above threshold. Returning default small ellipse.")
+        return (*initial_yx, 10, 10, 0)
+
+    # 2. Connected Components: Find the blob nearest to the user click
+    # This removes random noise elsewhere in the patch
+    labeled_map = label(binary_mask)
+    regions = regionprops(labeled_map)
+    
+    # Find region with centroid closest to initial_yx
+    best_region = None
+    min_dist = float('inf')
+    
+    user_y, user_x = initial_yx
+    
+    for region in regions:
+        # Check distance to user click
+        cy, cx = region.centroid
+        dist = (cy - user_y)**2 + (cx - user_x)**2
+        
+        if dist < min_dist:
+            min_dist = dist
+            best_region = region
+            
+    if best_region is None:
+        return (*initial_yx, 10, 10, 0)
+
+    # 3. Moment-Based Fitting (The "Smart" Part)
+    # regionprops already calculates the 'inertia_tensor' which is related to covariance
+    # equivalent to fitting an ellipse to the pixel distribution.
+    
+    y0, x0 = best_region.centroid
+    orientation = best_region.orientation # In radians
+    
+    # Convert inertia tensor to axes lengths
+    # axis_length ~ 4 * sqrt(inertia)
+    major_axis = best_region.major_axis_length
+    minor_axis = best_region.minor_axis_length
+    
+    # Convert rotation to degrees (counter-clockwise)
+    angle_deg = -np.degrees(orientation)
+    
+    # 4. Expansion Factor (Optional)
+    # The raw fit covers the "mass". Usually, we want to visualize the boundary.
+    # Expanding slightly often looks better visually for "encapsulating" the defect.
+    expansion = 1.2
+    major_axis *= expansion
+    minor_axis *= expansion
+    
+    return (y0, x0, major_axis, minor_axis, angle_deg)
+
+# --- Visualization Helper ---
+def plot_refined_ellipse(raw_patch, z_score_map, initial_yx):
+    # 1. Calculate Refined Params
+    refined_params = refine_anomaly_ellipse(z_score_map, initial_yx, sigma_limit=2.5)
+    cy, cx, major, minor, angle = refined_params
+    
+    fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+    
+    # Plot Z-Score with refined ellipse
+    ax[0].imshow(z_score_map, cmap='RdBu_r', vmin=-5, vmax=5)
+    ax[0].set_title("Z-Score Map (>2.5$\sigma$ used)")
+    
+    # Draw Ellipse
+    e = Ellipse((cx, cy), width=major, height=minor, angle=angle, 
+                edgecolor='lime', facecolor='none', lw=2, linestyle='-')
+    ax[0].add_patch(e)
+    ax[0].plot(cx, cy, '+', color='lime')
+    
+    # Plot Raw Data with refined ellipse
+    ax[1].imshow(raw_patch, cmap='gray')
+    ax[1].set_title("Refined Ellipse on Raw Data")
+    e2 = Ellipse((cx, cy), width=major, height=minor, angle=angle, 
+                 edgecolor='lime', facecolor='none', lw=2, linestyle='-')
+    ax[1].add_patch(e2)
+    
+    print(f"Refined Geometry:\nCenter: ({cy:.1f}, {cx:.1f})\nSize: {major:.1f} x {minor:.1f}\nAngle: {angle:.1f}°")
+    
+    plt.show()
