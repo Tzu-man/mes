@@ -1,0 +1,335 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+from scipy.signal import find_peaks, correlate, correlation_lags
+from skimage.util import img_as_float
+from skimage.registration import phase_cross_correlation
+from skimage.transform import AffineTransform, warp, rotate, radon, rescale
+from skimage.filters import difference_of_gaussians, window
+from dataclasses import dataclass
+
+
+@dataclass
+class CellGrid:
+    unit_cell: np.ndarray  # The perfect, noise-free cell
+    variance_map: np.ndarray  # Shows where defects usually happen
+    grid_shape: tuple  # (Rows, Cols)
+
+
+class SEMLatticePro:
+    def __init__(self,
+                 approx_period_range=(10, 300),
+                 max_instances_y=None,
+                 max_instances_x=None,
+                 padding_ratio=0.2):
+
+        self.min_p, self.max_p = approx_period_range
+        self.max_instances_y = max_instances_y
+        self.max_instances_x = max_instances_x
+        self.pad_ratio = padding_ratio
+
+    def run(self, image: np.ndarray):
+        """
+        Executes the signal processing pipeline.
+        """
+        # 0. Convert & Normalise & Sanitize
+        img = img_as_float(image)
+        # Fix NaNs/Infs that might exist in source
+        img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
+
+        # Avoid division by zero
+        range_val = np.max(img) - np.min(img)
+        if range_val == 0: range_val = 1e-8
+        img = (img - np.min(img)) / range_val
+
+        # 1. Deskew (Geometry Correction)
+        img_rot, angle = self._auto_deskew(img)
+        print(f"1. Deskew: Corrected by {angle:.2f} degrees")
+
+        # 2. Spectral Filtering
+        print("2. Signal Processing: Applying Difference of Gaussians (DoG) filter...")
+        img_structure = difference_of_gaussians(img_rot, low_sigma=1, high_sigma=20)
+
+        # 3. Autocorrelation Period Estimation
+        py, px = self._estimate_period_autocorr(img_structure)
+        print(f"3. Period Estimation: Y={py:.2f} px, X={px:.2f} px")
+
+        # 4. Extract Initial Grid
+        cell_h, cell_w = int(np.round(py)), int(np.round(px))
+        pad_h, pad_w = int(cell_h * self.pad_ratio), int(cell_w * self.pad_ratio)
+
+        _, raw_patches = self._extract_grid(img_rot, py, px, cell_h, cell_w, pad_h, pad_w)
+
+        # 5. Iterative Refinement
+        print("4. Registration: Running 2-pass iterative refinement...")
+
+        # Pass 1: Rough stack
+        pass1_patches, _ = self._align_stack(raw_patches)
+
+        valid_p1 = [p for p in pass1_patches if np.any(p)]
+        if not valid_p1:
+            raise ValueError("No valid patches found after Pass 1.")
+
+        robust_template = np.median(valid_p1, axis=0)
+
+        # Pass 2: Register EVERYTHING to the robust template
+        final_patches = self._register_to_template(raw_patches, robust_template, (cell_h, cell_w))
+
+        if len(final_patches) == 0:
+            print("Warning: Registration returned 0 patches. Using Pass 1 results.")
+            final_patches = np.array(valid_p1)
+
+        # 6. Quality Control (Robust Filter)
+        clean_patches = self._filter_outliers(final_patches, robust_template, threshold=0.3)
+        print(f"5. Stacking: Integrated {len(clean_patches)} valid cells.")
+
+        if len(clean_patches) == 0:
+            raise ValueError("CRITICAL: Outlier filter removed all cells. Check image quality.")
+
+        return CellGrid(
+            unit_cell=np.mean(clean_patches, axis=0),
+            variance_map=np.var(clean_patches, axis=0),
+            grid_shape=raw_patches.shape
+        ), clean_patches
+
+    def _estimate_period_autocorr(self, img):
+        """
+        Uses 1D Autocorrelation to find the fundamental frequency.
+        """
+
+        def get_period(profile, max_instances):
+            prof_w = profile * window('hann', len(profile))
+            result = correlate(prof_w, prof_w, mode='full')
+            lags = correlation_lags(len(prof_w), len(prof_w), mode='full')
+
+            mask = lags > 0
+            result = result[mask]
+            lags = lags[mask]
+
+            # Distance logic based on max instances
+            min_dist = len(profile) // (max_instances + 2) if max_instances else int(self.min_p)
+            min_dist = max(min_dist, 5)
+
+            peaks, _ = find_peaks(result, distance=min_dist, prominence=0.05 * np.max(result))
+
+            if len(peaks) == 0: return 50.0
+            return float(lags[peaks[0]])
+
+        # Profile Processing
+        prof_y = np.median(img, axis=1)
+        prof_x = np.median(img, axis=0)
+
+        limit_y = self.max_instances_y if self.max_instances_y else 20
+        limit_x = self.max_instances_x if self.max_instances_x else 20
+
+        py = get_period(prof_y, limit_y)
+        px = get_period(prof_x, limit_x)
+
+        return py, px
+
+    def _register_to_template(self, raw_grid, template, size):
+        """
+        Registers raw patches to a template with sub-pixel accuracy.
+        """
+        Ny, Nx = raw_grid.shape
+        h, w = size
+        aligned = []
+
+        # Find target shape safely
+        target_shape = (h, w)
+        for r in range(Ny):
+            for c in range(Nx):
+                if raw_grid[r, c] is not None:
+                    target_shape = raw_grid[r, c].shape
+                    break
+
+        pad_h = (target_shape[0] - template.shape[0]) // 2
+        pad_w = (target_shape[1] - template.shape[1]) // 2
+
+        if pad_h < 0: pad_h = 0
+        if pad_w < 0: pad_w = 0
+
+        pad_h_after = max(0, target_shape[0] - template.shape[0] - pad_h)
+        pad_w_after = max(0, target_shape[1] - template.shape[1] - pad_w)
+
+        template_padded = np.pad(template,
+                                 ((pad_h, pad_h_after),
+                                  (pad_w, pad_w_after)),
+                                 mode='edge')
+
+        for r in range(Ny):
+            for c in range(Nx):
+                curr = raw_grid[r, c]
+                if curr is None or np.sum(curr) == 0: continue
+
+                # Check shapes match
+                if curr.shape != template_padded.shape: continue
+
+                try:
+                    # REMOVED return_error=True
+                    shift_vec, error, _ = phase_cross_correlation(
+                        template_padded, curr, upsample_factor=100
+                    )
+                except Exception:
+                    continue
+
+                tform = AffineTransform(translation=shift_vec)
+                warped = warp(curr, tform, mode='reflect')
+
+                cy, cx = warped.shape[0] // 2, warped.shape[1] // 2
+                cell = warped[cy - h // 2: cy + h // 2, cx - w // 2: cx + w // 2]
+
+                if cell.shape == (h, w):
+                    aligned.append(cell)
+
+        return np.array(aligned)
+
+    def _filter_outliers(self, patches, template, threshold=0.3):
+        """
+        Correlates every registered patch with the mean.
+        Drops patches that don't look like the others.
+        SAFE MODE: Guarantees return of data.
+        """
+        if len(patches) == 0:
+            return np.array([])
+
+        # Normalize template
+        std_tmpl = np.std(template)
+        if std_tmpl == 0: std_tmpl = 1e-8
+        tmpl_norm = (template - np.mean(template)) / std_tmpl
+
+        scores = []
+        valid_patches = []
+
+        for p in patches:
+            std_p = np.std(p)
+            if std_p == 0:
+                scores.append(-1.0)  # Bad score
+                continue
+
+            p_norm = (p - np.mean(p)) / std_p
+            score = np.mean(p_norm * tmpl_norm)
+            scores.append(score)
+
+            if score > threshold:
+                valid_patches.append(p)
+
+        # --- GUARANTEED FALLBACK ---
+        # If strict threshold killed everyone, we MUST return something.
+        if len(valid_patches) == 0:
+            print(f"Warning: Outlier filter (thresh={threshold}) rejected all cells.")
+            print("Action: Recovering the best 50% of matches regardless of score.")
+
+            # Pair scores with patches
+            pairs = list(zip(scores, patches))
+            # Sort by score descending (best first)
+            pairs.sort(key=lambda x: x[0], reverse=True)
+
+            # Take top 50% (or at least 1)
+            count_to_keep = max(1, len(patches) // 2)
+            valid_patches = [p for s, p in pairs[:count_to_keep]]
+
+        return np.array(valid_patches)
+
+    def _extract_grid(self, img, py, px, h, w, ph, pw):
+        Ny, Nx = int(img.shape[0] / py), int(img.shape[1] / px)
+        patches = np.full((Ny, Nx), None, dtype=object)
+
+        full_h, full_w = h + 2 * ph, w + 2 * pw
+
+        for r in range(Ny):
+            for c in range(Nx):
+                cy = r * py + py / 2
+                cx = c * px + px / 2
+                patches[r, c] = self._safe_extract(img, cy, cx, full_h, full_w)
+
+        return None, patches
+
+    def _safe_extract(self, img, y, x, h, w):
+        img_h, img_w = img.shape
+        y_start, x_start = int(y - h // 2), int(x - w // 2)
+        y_end, x_end = y_start + h, x_start + w
+
+        pad_y_pre = max(0, -y_start)
+        pad_y_post = max(0, y_end - img_h)
+        pad_x_pre = max(0, -x_start)
+        pad_x_post = max(0, x_end - img_w)
+
+        if any([pad_y_pre, pad_y_post, pad_x_pre, pad_x_post]):
+            img_pad = np.pad(img, ((pad_y_pre, pad_y_post), (pad_x_pre, pad_x_post)), mode='edge')
+            return img_pad[y_start + pad_y_pre: y_end + pad_y_pre,
+                   x_start + pad_x_pre: x_end + pad_x_pre]
+        return img[y_start:y_end, x_start:x_end]
+
+    def _align_stack(self, raw_grid):
+        patches = []
+        for row in raw_grid:
+            for p in row:
+                if p is not None: patches.append(p)
+        return np.array(patches), None
+
+    def _auto_deskew(self, image):
+        small = rescale(image, 0.25, anti_aliasing=True)
+        angles = np.linspace(-5.0, 5.0, 80)
+        sinogram = radon(small, theta=angles, circle=False)
+        best_angle = angles[np.argmax(np.var(sinogram, axis=0))]
+        if abs(best_angle) > 0.1:
+            return rotate(image, -best_angle, mode='reflect'), best_angle
+        return image, 0.0
+
+
+def plot_results(result, all_cells):
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    # Check if unit_cell is valid before plotting
+    if result.unit_cell is None or result.unit_cell.size == 0 or np.isnan(result.unit_cell).all():
+        print("Error: Unit cell is empty or NaN. Cannot plot.")
+        return
+
+    axes[0].imshow(result.unit_cell, cmap='gray')
+    axes[0].set_title("1. Final Unit Cell\n(Robust Median Stack)")
+    axes[0].axis('off')
+
+    axes[1].imshow(result.variance_map, cmap='magma')
+    axes[1].set_title("2. Variance Map\n(Brighter = More Variation)")
+    axes[1].axis('off')
+
+    h, w = result.unit_cell.shape
+    preview = np.zeros((h * 4, w * 4))
+    count = 0
+    try:
+        for i in range(4):
+            for j in range(4):
+                if count < len(all_cells):
+                    preview[i * h:(i + 1) * h, j * w:(j + 1) * w] = all_cells[count]
+                    count += 1
+    except:
+        pass
+
+    axes[2].imshow(preview, cmap='gray')
+    axes[2].set_title("3. Aligned Instances (Subset)")
+    axes[2].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+
+# --- RUN ---
+if __name__ == "__main__":
+    try:
+        path = r'C:\Users\user\Downloads\Screenshot 2025-12-17 201334.png'
+        img = np.array(Image.open(path).convert('L'))
+
+        pipeline = SEMLatticePro(
+            approx_period_range=(10, 300),
+            max_instances_y=5,
+            max_instances_x=15
+        )
+
+        res, cells = pipeline.run(img)
+        plot_results(res, cells)
+
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
