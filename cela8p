@@ -1,0 +1,1302 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+from scipy.signal import find_peaks, correlate, correlation_lags
+from skimage.util import img_as_float
+from skimage.registration import phase_cross_correlation
+from skimage.transform import AffineTransform, warp, rotate, radon, rescale
+from skimage.filters import difference_of_gaussians, window
+from dataclasses import dataclass
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+from scipy.signal import find_peaks, correlate, correlation_lags
+from scipy.stats import norm
+from skimage.util import img_as_float
+from skimage.registration import phase_cross_correlation
+from skimage.transform import AffineTransform, warp, rotate, radon, rescale
+from skimage.filters import difference_of_gaussians, window
+from sklearn.decomposition import PCA
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.gridspec import GridSpec
+from dataclasses import dataclass
+
+@dataclass
+class CellGrid:
+    unit_cell: np.ndarray  # The perfect, noise-free cell
+    variance_map: np.ndarray  # Shows where defects usually happen
+    grid_shape: tuple  # (Rows, Cols)
+
+
+class SEMLatticePro:
+    def __init__(self,
+                 approx_period_range=(10, 300),
+                 max_instances_y=None,
+                 max_instances_x=None,
+                 padding_ratio=0.2):
+
+        self.min_p, self.max_p = approx_period_range
+        self.max_instances_y = max_instances_y
+        self.max_instances_x = max_instances_x
+        self.pad_ratio = padding_ratio
+
+        # --- NEW: Metadata Storage for Global Conversion ---
+        self.meta = {}
+
+    def run(self, image: np.ndarray):
+        """
+        Executes the signal processing pipeline.
+        """
+        # 0. Convert & Normalise & Sanitize
+        img = img_as_float(image)
+        # Fix NaNs/Infs that might exist in source
+        img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
+
+        # Avoid division by zero
+        range_val = np.max(img) - np.min(img)
+        if range_val == 0: range_val = 1e-8
+        img = (img - np.min(img)) / range_val
+
+        # 1. Deskew (Geometry Correction)
+        img_rot, angle = self._auto_deskew(img)
+        print(f"1. Deskew: Corrected by {angle:.2f} degrees")
+
+        # 2. Spectral Filtering
+        print("2. Signal Processing: Applying Difference of Gaussians (DoG) filter...")
+        img_structure = difference_of_gaussians(img_rot, low_sigma=1, high_sigma=20)
+
+        # 3. Autocorrelation Period Estimation
+        py, px = self._estimate_period_autocorr(img_structure)
+        print(f"3. Period Estimation: Y={py:.2f} px, X={px:.2f} px")
+
+        # 4. Extract Initial Grid
+        cell_h, cell_w = int(np.round(py)), int(np.round(px))
+        pad_h, pad_w = int(cell_h * self.pad_ratio), int(cell_w * self.pad_ratio)
+
+        # --- SAVE GEOMETRY for Global Analysis ---
+        self.meta = {
+            'angle': angle,
+            'py': py,
+            'px': px,
+            'h': cell_h,
+            'w': cell_w,
+            'ph': pad_h,
+            'pw': pad_w,
+            'img_shape': img.shape
+        }
+        print(f"Geometry Saved in self.meta: {self.meta}")
+
+        _, raw_patches = self._extract_grid(img_rot, py, px, cell_h, cell_w, pad_h, pad_w)
+
+        # 5. Iterative Refinement
+        print("4. Registration: Running 2-pass iterative refinement...")
+
+        # Pass 1: Rough stack
+        pass1_patches, _ = self._align_stack(raw_patches)
+
+        valid_p1 = [p for p in pass1_patches if np.any(p)]
+        if not valid_p1:
+            raise ValueError("No valid patches found after Pass 1.")
+
+        robust_template = np.median(valid_p1, axis=0)
+
+        # Pass 2: Register EVERYTHING to the robust template
+        final_patches = self._register_to_template(raw_patches, robust_template, (cell_h, cell_w))
+
+        if len(final_patches) == 0:
+            print("Warning: Registration returned 0 patches. Using Pass 1 results.")
+            final_patches = np.array(valid_p1)
+
+        # 6. Quality Control (Robust Filter)
+        clean_patches = self._filter_outliers(final_patches, robust_template, threshold=0.3)
+        print(f"5. Stacking: Integrated {len(clean_patches)} valid cells.")
+
+        if len(clean_patches) == 0:
+            raise ValueError("CRITICAL: Outlier filter removed all cells. Check image quality.")
+
+        return CellGrid(
+            unit_cell=np.mean(clean_patches, axis=0),
+            variance_map=np.var(clean_patches, axis=0),
+            grid_shape=raw_patches.shape
+        ), clean_patches
+
+    def _estimate_period_autocorr(self, img):
+        """
+        Uses 1D Autocorrelation to find the fundamental frequency.
+        """
+
+        def get_period(profile, max_instances):
+            prof_w = profile * window('hann', len(profile))
+            result = correlate(prof_w, prof_w, mode='full')
+            lags = correlation_lags(len(prof_w), len(prof_w), mode='full')
+
+            mask = lags > 0
+            result = result[mask]
+            lags = lags[mask]
+
+            # Distance logic based on max instances
+            min_dist = len(profile) // (max_instances + 2) if max_instances else int(self.min_p)
+            min_dist = max(min_dist, 5)
+
+            peaks, _ = find_peaks(result, distance=min_dist, prominence=0.05 * np.max(result))
+
+            if len(peaks) == 0: return 50.0
+            return float(lags[peaks[0]])
+
+        # Profile Processing
+        prof_y = np.median(img, axis=1)
+        prof_x = np.median(img, axis=0)
+
+        limit_y = self.max_instances_y if self.max_instances_y else 20
+        limit_x = self.max_instances_x if self.max_instances_x else 20
+
+        py = get_period(prof_y, limit_y)
+        px = get_period(prof_x, limit_x)
+
+        return py, px
+
+    def _register_to_template(self, raw_grid, template, size):
+        """
+        Registers raw patches to a template with sub-pixel accuracy.
+        """
+        Ny, Nx = raw_grid.shape
+        h, w = size
+        aligned = []
+
+        # Find target shape safely
+        target_shape = (h, w)
+        for r in range(Ny):
+            for c in range(Nx):
+                if raw_grid[r, c] is not None:
+                    target_shape = raw_grid[r, c].shape
+                    break
+
+        pad_h = (target_shape[0] - template.shape[0]) // 2
+        pad_w = (target_shape[1] - template.shape[1]) // 2
+
+        if pad_h < 0: pad_h = 0
+        if pad_w < 0: pad_w = 0
+
+        pad_h_after = max(0, target_shape[0] - template.shape[0] - pad_h)
+        pad_w_after = max(0, target_shape[1] - template.shape[1] - pad_w)
+
+        template_padded = np.pad(template,
+                ((pad_h, pad_h_after),
+                                  (pad_w, pad_w_after)),
+                                 mode='edge')
+
+        for r in range(Ny):
+            for c in range(Nx):
+                curr = raw_grid[r, c]
+                if curr is None or np.sum(curr) == 0: continue
+
+                # Check shapes match
+                if curr.shape != template_padded.shape: continue
+
+                try:
+                    # REMOVED return_error=True
+                    shift_vec, error, _ = phase_cross_correlation(
+                        template_padded, curr, upsample_factor=100
+                    )
+                except Exception:
+                    continue
+
+                tform = AffineTransform(translation=shift_vec)
+                warped = warp(curr, tform, mode='reflect')
+
+                cy, cx = warped.shape[0] // 2, warped.shape[1] // 2
+                cell = warped[cy - h // 2: cy + h // 2, cx - w // 2: cx + w // 2]
+
+                if cell.shape == (h, w):
+                    aligned.append(cell)
+
+        return np.array(aligned)
+
+    def _filter_outliers(self, patches, template, threshold=0.3):
+        """
+        Correlates every registered patch with the mean.
+        Drops patches that don't look like the others.
+        SAFE MODE: Guarantees return of data.
+        """
+        if len(patches) == 0:
+            return np.array([])
+
+        # Normalize template
+        std_tmpl = np.std(template)
+        if std_tmpl == 0: std_tmpl = 1e-8
+        tmpl_norm = (template - np.mean(template)) / std_tmpl
+
+        scores = []
+        valid_patches = []
+
+        for p in patches:
+            std_p = np.std(p)
+            if std_p == 0:
+                scores.append(-1.0)  # Bad score
+                continue
+
+            p_norm = (p - np.mean(p)) / std_p
+            score = np.mean(p_norm * tmpl_norm)
+            scores.append(score)
+
+            if score > threshold:
+                valid_patches.append(p)
+
+        # --- GUARANTEED FALLBACK ---
+        # If strict threshold killed everyone, we MUST return something.
+        if len(valid_patches) == 0:
+            print(f"Warning: Outlier filter (thresh={threshold}) rejected all cells.")
+            print("Action: Recovering the best 50% of matches regardless of score.")
+
+            # Pair scores with patches
+            pairs = list(zip(scores, patches))
+            # Sort by score descending (best first)
+            pairs.sort(key=lambda x: x[0], reverse=True)
+
+            # Take top 50% (or at least 1)
+            count_to_keep = max(1, len(patches) // 2)
+            valid_patches = [p for s, p in pairs[:count_to_keep]]
+
+        return np.array(valid_patches)
+
+    def _extract_grid(self, img, py, px, h, w, ph, pw):
+        Ny, Nx = int(img.shape[0] / py), int(img.shape[1] / px)
+        patches = np.full((Ny, Nx), None, dtype=object)
+
+        full_h, full_w = h + 2 * ph, w + 2 * pw
+
+        for r in range(Ny):
+            for c in range(Nx):
+                cy = r * py + py / 2
+                cx = c * px + px / 2
+                patches[r, c] = self._safe_extract(img, cy, cx, full_h, full_w)
+
+        return None, patches
+
+    def _safe_extract(self, img, y, x, h, w):
+        img_h, img_w = img.shape
+        y_start, x_start = int(y - h // 2), int(x - w // 2)
+        y_end, x_end = y_start + h, x_start + w
+
+        pad_y_pre = max(0, -y_start)
+        pad_y_post = max(0, y_end - img_h)
+        pad_x_pre = max(0, -x_start)
+        pad_x_post = max(0, x_end - img_w)
+
+        if any([pad_y_pre, pad_y_post, pad_x_pre, pad_x_post]):
+            img_pad = np.pad(img, ((pad_y_pre, pad_y_post), (pad_x_pre, pad_x_post)), mode='edge')
+            return img_pad[y_start + pad_y_pre: y_end + pad_y_pre,
+                   x_start + pad_x_pre: x_end + pad_x_pre]
+        return img[y_start:y_end, x_start:x_end]
+
+    def _align_stack(self, raw_grid):
+        patches = []
+        for row in raw_grid:
+            for p in row:
+                if p is not None: patches.append(p)
+        return np.array(patches), None
+
+    def _auto_deskew(self, image):
+        small = rescale(image, 0.25, anti_aliasing=True)
+        angles = np.linspace(-5.0, 5.0, 80)
+        sinogram = radon(small, theta=angles, circle=False)
+        best_angle = angles[np.argmax(np.var(sinogram, axis=0))]
+        if abs(best_angle) > 0.1:
+            return rotate(image, -best_angle, mode='reflect'), best_angle
+        return image, 0.0
+
+
+def plot_results(result, all_cells):
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    # Check if unit_cell is valid before plotting
+    if result.unit_cell is None or result.unit_cell.size == 0 or np.isnan(result.unit_cell).all():
+        print("Error: Unit cell is empty or NaN. Cannot plot.")
+        return
+
+    axes[0].imshow(result.unit_cell, cmap='gray')
+    axes[0].set_title("1. Final Unit Cell\n(Robust Median Stack)")
+    axes[0].axis('off')
+
+    axes[1].imshow(result.variance_map, cmap='magma')
+    axes[1].set_title("2. Variance Map\n(Brighter = More Variation)")
+    axes[1].axis('off')
+
+    h, w = result.unit_cell.shape
+    preview = np.zeros((h * 4, w * 4))
+    count = 0
+    try:
+        for i in range(4):
+            for j in range(4):
+                if count < len(all_cells):
+                    preview[i * h:(i + 1) * h, j * w:(j + 1) * w] = all_cells[count]
+                    count += 1
+    except:
+        pass
+
+    axes[2].imshow(preview, cmap='gray')
+    axes[2].set_title("3. Aligned Instances (Subset)")
+    axes[2].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+
+def analyze_anomaly(cells, result_grid, patch_idx, target_yx):
+    """
+    Performs precision anomaly analysis on a specific lattice cell.
+
+    Generates a 3-panel publication-ready figure:
+    1. Raw Patch: The specific cell instance.
+    2. Z-Score Map: (Patch - EnsembleMean) / EnsembleStd. Highlights statistical deviations.
+    3. Cross-Section: 1D profile of the Z-score through the anomaly.
+
+    Parameters:
+    -----------
+    cells : list or np.ndarray
+        The list of aligned cell images returned by the pipeline.
+    result_grid : CellGrid
+        The result object containing .unit_cell (mean) and .variance_map.
+    patch_idx : int
+        The index of the specific patch to analyze (0 to N-1).
+    target_yx : tuple (y, x)
+        The pixel coordinates of the tiny anomaly to measure.
+    """
+
+    # 1. Prepare Data
+    if patch_idx >= len(cells):
+        raise ValueError(f"Patch index {patch_idx} out of range (max {len(cells) - 1})")
+
+    raw_patch = cells[patch_idx]
+    ensemble_mean = result_grid.unit_cell
+    # Std Deviation = Sqrt(Variance). Add epsilon to avoid divide-by-zero
+    ensemble_std = np.sqrt(result_grid.variance_map) + 1e-8
+
+    # Calculate Z-Score Map (Standard Score)
+    # This measures how many Standard Deviations this pixel is away from the "Norm"
+    z_score_map = (raw_patch - ensemble_mean) / ensemble_std
+
+    py, px = target_yx
+    z_val = z_score_map[py, px]
+
+    # 2. Setup Figure (Publication Style)
+    plt.rcParams.update({'font.size': 10, 'font.family': 'sans-serif'})
+    fig = plt.figure(figsize=(12, 5), dpi=150)
+    gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 1.5], wspace=0.3)
+
+    # --- Panel A: The Raw Patch ---
+    ax1 = fig.add_subplot(gs[0])
+    im1 = ax1.imshow(raw_patch, cmap='gray', interpolation='none')
+    ax1.set_title(f"A. Raw Patch (Index {patch_idx})", fontweight='bold')
+
+    # Mark the spot
+    rect = patches.Circle((px, py), radius=2, linewidth=1.5, edgecolor='lime', facecolor='none')
+    ax1.add_patch(rect)
+    ax1.plot(px, py, 'x', color='lime', markersize=6)
+    ax1.set_xlabel("Pixel X")
+    ax1.set_ylabel("Pixel Y")
+
+    # --- Panel B: Z-Score Significance Map ---
+    ax2 = fig.add_subplot(gs[1])
+    # Use diverging colormap (Red=High, Blue=Low, White=Normal)
+    # We clip at +/- 5 sigma for contrast
+    im2 = ax2.imshow(z_score_map, cmap='RdBu_r', vmin=-5, vmax=5, interpolation='none')
+    ax2.set_title("B. Statistical Deviation (Z-Score)", fontweight='bold')
+
+    # Mark the spot
+    ax2.plot(px, py, 'x', color='black', markersize=8, markeredgewidth=2)
+
+    # Colorbar with scientific notation if needed
+    divider = make_axes_locatable(ax2)
+    cax = divider.append_axes("right", size="5%", pad=0.1)
+    cbar = plt.colorbar(im2, cax=cax)
+    cbar.set_label(r'Deviation ($\sigma$)', rotation=270, labelpad=15)
+
+    # --- Panel C: 1D Cross-Section Analysis ---
+    ax3 = fig.add_subplot(gs[2])
+
+    # Extract profile across the X-axis at the specific Y level
+    profile_z = z_score_map[py, :]
+    x_axis = np.arange(len(profile_z))
+
+    # Plot standard deviation bands
+    ax3.fill_between(x_axis, -1, 1, color='gray', alpha=0.1, label='1$\sigma$ (Normal)')
+    ax3.fill_between(x_axis, -3, 3, color='gray', alpha=0.05, label='3$\sigma$ (Noise Limit)')
+
+    # Plot the profile
+    ax3.plot(x_axis, profile_z, color='#333333', lw=1.5, label='Z-Score Profile')
+
+    # Highlight the anomaly point
+    ax3.scatter([px], [z_val], color='red', s=50, zorder=5, label=f'Anomaly ({z_val:.1f}$\sigma$)')
+
+    # Annotate
+    ax3.axhline(0, color='black', lw=0.5, linestyle='--')
+    ax3.axvline(px, color='red', lw=0.5, linestyle=':', alpha=0.5)
+
+    # Styling
+    ax3.set_title(f"C. Cross-Section at Y={py}", fontweight='bold')
+    ax3.set_xlabel("Pixel X")
+    ax3.set_ylabel(r'Z-Score ($\sigma$)')
+    ax3.legend(loc='upper right', frameon=True, fontsize=8)
+    ax3.grid(True, linestyle=':', alpha=0.3)
+
+    # Dynamic Limits: Ensure we see the anomaly even if it's huge
+    max_z = max(5, abs(z_val) * 1.2)
+    ax3.set_ylim(-max_z, max_z)
+
+    plt.tight_layout()
+    plt.show()
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
+from matplotlib.gridspec import GridSpec
+from scipy.stats import norm
+
+
+def analyze_anomaly_ellipse(cells, result_grid, patch_idx, center_yx, axes_len, angle=0):
+    """
+    Performs precision anomaly analysis defined by an elliptical region.
+
+    Parameters:
+    -----------
+    cells : list/array
+        Aligned cell images.
+    result_grid : CellGrid
+        Result object with .unit_cell and .variance_map.
+    patch_idx : int
+        Index of the patch to analyze.
+    center_yx : tuple (y, x)
+        Center of the ellipse.
+    axes_len : tuple (major_axis, minor_axis)
+        Total lengths of the axes (diameters, not radii).
+    angle : float
+        Rotation in degrees (counter-clockwise).
+    """
+
+    # --- 1. Data Preparation ---
+    if patch_idx >= len(cells):
+        raise ValueError("Patch index out of range.")
+
+    raw_patch = cells[patch_idx]
+    ensemble_mean = result_grid.unit_cell
+    # Use variance map for Z-score (add epsilon for stability)
+    ensemble_std = np.sqrt(result_grid.variance_map) + 1e-8
+
+    # Calculate Z-Score Map
+    z_score_map = (raw_patch - ensemble_mean) / ensemble_std
+
+    # --- 2. Ellipse Masking & Integration ---
+    # Create a boolean mask for the ellipse to extract "Object" pixels
+    H, W = raw_patch.shape
+    Y, X = np.ogrid[:H, :W]
+
+    cy, cx = center_yx
+    major, minor = axes_len
+    theta = np.radians(angle)
+
+    # Standard ellipse equation with rotation
+    # ((x-cx)cos + (y-cy)sin)^2 / (major/2)^2 + ... <= 1
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+
+    # Distances from center
+    dx = X - cx
+    dy = Y - cy
+
+    # Rotated coordinates
+    x_rot = dx * cos_t + dy * sin_t
+    y_rot = dx * -sin_t + dy * cos_t
+
+    # Ellipse Mask
+    mask_ellipse = ((x_rot ** 2) / (major / 2) ** 2) + ((y_rot ** 2) / (minor / 2) ** 2) <= 1
+
+    # Extract Statistics
+    object_pixels = z_score_map[mask_ellipse]
+    bg_pixels = z_score_map[~mask_ellipse]
+
+    if len(object_pixels) == 0:
+        raise ValueError("Ellipse is too small or outside image bounds (0 pixels selected).")
+
+    # Metrics
+    mean_z_object = np.mean(object_pixels)
+    max_z_object = np.max(np.abs(object_pixels)) * np.sign(np.mean(object_pixels))  # Sign of dominant deviation
+    integrated_z = np.sum(np.abs(object_pixels))  # Total "Energy" of the anomaly
+
+    # --- 3. Plotting ---
+    plt.rcParams.update({'font.size': 9, 'font.family': 'sans-serif'})
+    fig = plt.figure(figsize=(14, 5), dpi=150)
+    gs = GridSpec(1, 3, width_ratios=[1, 1, 1.2], wspace=0.3)
+
+    # Helper to draw ellipse patches
+    def draw_ellipse(ax, color='lime', ls='-'):
+        e = Ellipse(xy=(cx, cy), width=major, height=minor, angle=-angle,
+                    # Matplotlib angle is clockwise? Check alignment
+                    edgecolor=color, facecolor='none', linewidth=1.5, linestyle=ls)
+        ax.add_patch(e)
+        # Mark center
+        ax.plot(cx, cy, '+', color=color, markersize=5, alpha=0.7)
+
+    # Panel A: Raw Data
+    ax1 = fig.add_subplot(gs[0])
+    ax1.imshow(raw_patch, cmap='gray', interpolation='none')
+    draw_ellipse(ax1, color='#00FF00')  # Lime Green
+    ax1.set_title(f"A. Raw Patch (Idx {patch_idx})", fontweight='bold')
+    ax1.set_xlabel("Pixel X")
+    ax1.set_ylabel("Pixel Y")
+
+    # Panel B: Z-Score Map (Spatial Context)
+    ax2 = fig.add_subplot(gs[1])
+    # Diverging colormap centered on 0 (White)
+    im2 = ax2.imshow(z_score_map, cmap='RdBu_r', vmin=-6, vmax=6, interpolation='none')
+    draw_ellipse(ax2, color='black', ls='--')
+    ax2.set_title("B. Z-Score Deviation Map", fontweight='bold')
+
+    # Add Colorbar
+    cbar = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+    cbar.set_label(r'Deviation ($\sigma$)', rotation=270, labelpad=15)
+
+    # Annotate stats on the map
+    text_stats = (f"Region Stats:\n"
+                  f"Mean Z: {mean_z_object:.1f}$\sigma$\n"
+                  f"Peak Z: {max_z_object:.1f}$\sigma$")
+    ax2.text(0.02, 0.98, text_stats, transform=ax2.transAxes,
+             verticalalignment='top', color='black', fontsize=8,
+             bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))
+
+    # Panel C: Statistical Integration (Histogram)
+    # This proves the anomaly is distinct from the baseline
+    ax3 = fig.add_subplot(gs[2])
+
+    # 1. Plot Background Distribution (Baseline)
+    # We expect this to be Gaussian centered at 0 with width 1
+    bins = np.linspace(-6, 6, 60)
+    ax3.hist(bg_pixels.flatten(), bins=bins, density=True,
+             color='gray', alpha=0.3, label='Baseline (Background)')
+
+    # 2. Plot Object Distribution (Inside Ellipse)
+    ax3.hist(object_pixels.flatten(), bins=bins, density=True,
+             color='red', alpha=0.6, label='Anomaly (Inside Ellipse)')
+
+    # 3. Fit Gaussian to Background to show "Ideal"
+    x_axis = np.linspace(-6, 6, 100)
+    ax3.plot(x_axis, norm.pdf(x_axis, 0, 1), 'k--', lw=1, alpha=0.5, label='Ideal Normal Dist')
+
+    # 4. Vertical Lines for Means
+    ax3.axvline(mean_z_object, color='red', linestyle='--', linewidth=1.5)
+    ax3.text(mean_z_object, ax3.get_ylim()[1] * 0.9, f" $\mu={mean_z_object:.1f}\sigma$",
+             color='red', ha='left' if mean_z_object > 0 else 'right')
+
+    # Styling
+    ax3.set_title("C. Statistical Separation", fontweight='bold')
+    ax3.set_xlabel(r'Z-Score Value ($\sigma$)')
+    ax3.set_ylabel('Probability Density')
+    ax3.legend(loc='upper right', fontsize=8)
+    ax3.grid(True, linestyle=':', alpha=0.3)
+
+    # Print Interpretation
+    print(f"--- Analysis Results ---")
+    print(f"Integrated Z-Score (Total Energy): {integrated_z:.2f}")
+    print(f"Mean Deviation inside Ellipse:     {mean_z_object:.2f} sigma")
+    print(
+        f"Is this significant?               {'YES (Distinct Population)' if abs(mean_z_object) > 2 else 'NO (Noise)'}")
+
+    plt.tight_layout()
+    plt.show()
+
+
+def analyze_pca_modes(cells, components_to_plot=(1, 2, 3)):
+    """
+    Visualizes PCA modes in a 4-panel layout:
+    1. RGB Composite of the 3 selected modes.
+    2. Selected Mode A (Magenta)
+    3. Selected Mode B (Cyan)
+    4. Selected Mode C (Yellow)
+    """
+
+    # 1. Prepare Data
+    n_samples, h, w = cells.shape
+    X = cells.reshape(n_samples, h * w)
+
+    # Ensure user selected exactly 3
+    if len(components_to_plot) != 3:
+        raise ValueError("Please select exactly 3 components (e.g., (1, 2, 3)) for RGB visualization.")
+
+    # 2. Run PCA
+    n_components = max(components_to_plot)
+    print(f"Calculating PCA (computing top {n_components} components)...")
+    pca = PCA(n_components=n_components)
+    pca.fit(X)
+
+    # 3. Retrieve Eigen-Cells
+    # Indices are 1-based in argument, 0-based in array
+    idx_r, idx_g, idx_b = components_to_plot
+
+    comp_r = pca.components_[idx_r - 1].reshape(h, w)
+    comp_g = pca.components_[idx_g - 1].reshape(h, w)
+    comp_b = pca.components_[idx_b - 1].reshape(h, w)
+
+    # Variances
+    var_r = pca.explained_variance_ratio_[idx_r - 1] * 100
+    var_g = pca.explained_variance_ratio_[idx_g - 1] * 100
+    var_b = pca.explained_variance_ratio_[idx_b - 1] * 100
+    total_var = var_r + var_g + var_b
+
+    # 4. Create RGB Composite
+    def normalize_for_vis(img):
+        # Normalize to 0-1 for RGB display
+        # We use absolute max to center 0 at 0.5 if we wanted divergent,
+        # but for RGB mapping, simple min-max usually highlights structure best.
+        # Alternatively, mapping deviation: 0.5 + (img / max * 0.5)
+        m = np.max(np.abs(img))
+        if m == 0: return img
+        # Map -Max..+Max to 0..1
+        return 0.5 + 0.5 * (img / m)
+
+    rgb_img = np.dstack((
+        normalize_for_vis(comp_r),
+        normalize_for_vis(comp_g),
+        normalize_for_vis(comp_b)
+    ))
+
+    # 5. Plotting
+    # Dark Theme
+    plt.rcParams.update(
+        {'font.size': 11, 'axes.facecolor': 'black', 'figure.facecolor': '#181818', 'text.color': 'white',
+         'axes.labelcolor': 'white', 'xtick.color': 'white', 'ytick.color': 'white'})
+
+    fig = plt.figure(figsize=(16, 5))
+    gs = GridSpec(1, 4, width_ratios=[1.2, 1, 1, 1], wspace=0.1)
+
+    # --- Plot 1: RGB Composite ---
+    ax1 = fig.add_subplot(gs[0])
+    ax1.imshow(rgb_img)
+    ax1.set_title(f"RGB Composite\n(Cumulative Var: {total_var:.1f}%)", fontweight='bold', color='white')
+    ax1.set_xlabel(f"R: PC{idx_r}, G: PC{idx_g}, B: PC{idx_b}", fontsize=9)
+    ax1.set_xticks([])
+    ax1.set_yticks([])
+
+    # --- Helper Colormaps ---
+    cmap_m = LinearSegmentedColormap.from_list("NeonM", ["black", "magenta", "white"])
+    cmap_c = LinearSegmentedColormap.from_list("NeonC", ["black", "cyan", "white"])
+    cmap_y = LinearSegmentedColormap.from_list("NeonY", ["black", "yellow", "white"])
+
+    # --- Plot 2: Component A ---
+    ax2 = fig.add_subplot(gs[1])
+    limit = np.max(np.abs(comp_r))
+    ax2.imshow(comp_r, cmap=cmap_m, vmin=-limit, vmax=limit)
+    ax2.set_title(f"PC {idx_r}\nVar: {var_r:.1f}%", color='magenta', fontweight='bold')
+    ax2.axis('off')
+
+    # --- Plot 3: Component B ---
+    ax3 = fig.add_subplot(gs[2])
+    limit = np.max(np.abs(comp_g))
+    ax3.imshow(comp_g, cmap=cmap_c, vmin=-limit, vmax=limit)
+    ax3.set_title(f"PC {idx_g}\nVar: {var_g:.1f}%", color='cyan', fontweight='bold')
+    ax3.axis('off')
+
+    # --- Plot 4: Component C ---
+    ax4 = fig.add_subplot(gs[3])
+    limit = np.max(np.abs(comp_b))
+    ax4.imshow(comp_b, cmap=cmap_y, vmin=-limit, vmax=limit)
+    ax4.set_title(f"PC {idx_b}\nVar: {var_b:.1f}%", color='yellow', fontweight='bold')
+    ax4.axis('off')
+
+    plt.suptitle("Principal Component Analysis: Eigen-Cell Decomposition", fontsize=16, color='white', y=0.98)
+    plt.show()
+
+    # Restore defaults
+    plt.rcParams.update(plt.rcParamsDefault)
+
+
+import numpy as np
+from skimage.util import img_as_float
+from skimage.transform import rotate, AffineTransform, warp
+from skimage.registration import phase_cross_correlation
+
+
+def convert_global_to_local(global_yx, pipeline, image, result_grid):
+    """
+    Converts a GLOBAL coordinate (x,y on full image) to a LOCAL ALIGNED coordinate
+    (sub-pixel x,y on the specific unit cell), including all deskewing and registration shifts.
+
+    Parameters:
+    -----------
+    global_yx : tuple (y, x)
+        The coordinate on the original input image.
+    pipeline : SEMLatticePro
+        The pipeline instance (must contain populated .meta from a previous run).
+    image : np.ndarray
+        The original full-size input image.
+    result_grid : CellGrid
+        The output object from pipeline.run() containing the unit_cell template.
+
+    Returns:
+    --------
+    (local_y, local_x) : tuple
+        The sub-pixel coordinate relative to the top-left of the aligned unit cell.
+    aligned_cell : np.ndarray
+        The specific cell image (aligned) containing this point.
+    """
+
+    # 1. Retrieve Geometry Metadata
+    meta = pipeline.meta
+    if not meta:
+        raise ValueError("Pipeline metadata is empty. Run pipeline.run(img) first.")
+
+    py, px = meta['py'], meta['px']
+    h, w = meta['h'], meta['w']
+    ph, pw = meta['ph'], meta['pw']
+    angle = meta['angle']
+    gy, gx = global_yx
+
+    # 2. Deskew Transformation (Global -> Rotated Global)
+    # We must replicate the rotation done during processing to find the correct grid index
+    img_float = img_as_float(image)
+    cy_img, cx_img = img_float.shape[0] / 2, img_float.shape[1] / 2
+
+    if abs(angle) > 0.1:
+        # Rotate the image
+        img_rot = rotate(img_float, -angle, mode='reflect')
+
+        # Rotate the POINT (gy, gx) around the image center
+        rad = np.radians(-angle)
+        dy = gy - cy_img
+        dx = gx - cx_img
+
+        # Standard rotation matrix
+        gy_rot = cy_img + (dx * np.sin(rad) + dy * np.cos(rad))
+        gx_rot = cx_img + (dx * np.cos(rad) - dy * np.sin(rad))
+    else:
+        img_rot = img_float
+        gy_rot, gx_rot = gy, gx
+
+    # 3. Identify Grid Cell (Rotated Global -> Cell Index)
+    r_idx = int(gy_rot / py)
+    c_idx = int(gx_rot / px)
+
+    # Calculate the theoretical centroid of this cell
+    cell_cy = r_idx * py + py / 2
+    cell_cx = c_idx * px + px / 2
+
+    # 4. Extract Raw Patch
+    # We re-extract this specific patch using the pipeline's safe extraction logic
+    full_h, full_w = h + 2 * ph, w + 2 * pw
+
+    # NOTE: Accessing internal method _safe_extract.
+    # If using strictly as external, ensure this method is public or copied here.
+    raw_patch = pipeline._safe_extract(img_rot, cell_cy, cell_cx, full_h, full_w)
+
+    # 5. Register Patch (Find Sub-pixel Shift)
+    template = result_grid.unit_cell
+
+    # Pad template to match raw patch size
+    pad_h_t = max(0, (raw_patch.shape[0] - template.shape[0]) // 2)
+    pad_w_t = max(0, (raw_patch.shape[1] - template.shape[1]) // 2)
+    pad_h_post = max(0, raw_patch.shape[0] - template.shape[0] - pad_h_t)
+    pad_w_post = max(0, raw_patch.shape[1] - template.shape[1] - pad_w_t)
+
+    template_padded = np.pad(template, ((pad_h_t, pad_h_post), (pad_w_t, pad_w_post)), mode='edge')
+
+    try:
+        # Find how much the patch needs to move to match the template
+        shift_vec, _, _ = phase_cross_correlation(template_padded, raw_patch, upsample_factor=100)
+    except:
+        shift_vec = np.array([0, 0])
+
+    # 6. Apply Shift to Patch (Warp)
+    tform = AffineTransform(translation=shift_vec)
+    warped_patch = warp(raw_patch, tform, mode='reflect')
+
+    # Crop to final size (center crop)
+    cy_p, cx_p = warped_patch.shape[0] // 2, warped_patch.shape[1] // 2
+    aligned_cell = warped_patch[cy_p - h // 2: cy_p + h // 2, cx_p - w // 2: cx_p + w // 2]
+
+    # 7. Transform Coordinate (Rotated Global -> Local Aligned)
+
+    # Step A: Local Coordinate relative to the Extraction Window (Top-Left)
+    y_extract_start = cell_cy - full_h // 2
+    x_extract_start = cell_cx - full_w // 2
+
+    local_y_raw = gy_rot - y_extract_start
+    local_x_raw = gx_rot - x_extract_start
+
+    # Step B: Apply Registration Shift
+    # If the image was shifted by vector V, the feature at coordinate C moves to C+V.
+    local_y_aligned = local_y_raw + shift_vec[0]
+    local_x_aligned = local_x_raw + shift_vec[1]
+
+    # Step C: Apply Final Crop Offset
+    # We cropped the center of the warped patch.
+    # The (0,0) of the final cell is at (cy_p - h/2, cx_p - w/2) in the warped frame.
+    offset_y = cy_p - h // 2
+    offset_x = cx_p - w // 2
+
+    final_y = local_y_aligned - offset_y
+    final_x = local_x_aligned - offset_x
+
+    return (final_y, final_x), aligned_cell
+
+
+import numpy as np
+from skimage.registration import phase_cross_correlation
+from skimage.transform import AffineTransform, warp, rotate
+from skimage.util import img_as_float
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+
+
+@dataclass
+class CellMeta:
+    """Data structure for a single purified cell."""
+    image: np.ndarray  # The aligned, sub-pixel registered image
+    global_y: float  # Center Y coordinate in original image
+    global_x: float  # Center X coordinate in original image
+    grid_index: Tuple[int, int]  # (Row, Col) index in the lattice
+    correlation_score: float  # Similarity to Unit Cell (0.0 to 1.0)
+
+
+def purify_and_localize_cells(pipeline,
+                              original_image: np.ndarray,
+                              unit_cell: np.ndarray,
+                              correlation_threshold: float = 0.5) -> List[CellMeta]:
+    """
+    Re-extracts, aligns, and filters cells to provide precise global coordinates.
+
+    Parameters:
+    -----------
+    pipeline : SEMLatticePro
+        The pipeline object containing metadata (must have run successfully).
+    original_image : np.ndarray
+        The full input image (raw).
+    unit_cell : np.ndarray
+        The 'perfect' template (e.g., res.unit_cell) to align against.
+    correlation_threshold : float
+        Minimum correlation score (0-1) to keep a cell.
+        Higher = stricter purification.
+
+    Returns:
+    --------
+    List[CellMeta]
+        A list of data objects containing the image and its precise location.
+    """
+
+    # 1. Validation & Metadata Retrieval
+    if not pipeline.meta:
+        raise ValueError("Pipeline metadata missing. Please run 'pipeline.run(img)' first.")
+
+    meta = pipeline.meta
+    py, px = meta['py'], meta['px']
+    h, w = meta['h'], meta['w']
+    ph, pw = meta['ph'], meta['pw']
+    angle = meta['angle']
+
+    # 2. Prepare Image (Deskew)
+    # We must operate in the rotated space to extract aligned grids
+    img_float = img_as_float(original_image)
+    cy_img, cx_img = img_float.shape[0] / 2, img_float.shape[1] / 2
+
+    if abs(angle) > 0.1:
+        img_rot = rotate(img_float, -angle, mode='reflect')
+    else:
+        img_rot = img_float
+
+    # 3. Define Grid Dimensions
+    Ny = int(img_rot.shape[0] / py)
+    Nx = int(img_rot.shape[1] / px)
+    full_h, full_w = h + 2 * ph, w + 2 * pw
+
+    purified_data = []
+
+    # 4. Processing Loop
+    print(f"Purifying Grid ({Ny}x{Nx})...")
+
+    # Pad template once for efficiency
+    # We assume extraction includes padding, so we pad template to match expected extraction size
+    # However, safe_extract returns 'full_h' x 'full_w'.
+    # We need to center the unit_cell (h x w) inside that frame.
+    pad_h_t = (full_h - unit_cell.shape[0]) // 2
+    pad_w_t = (full_w - unit_cell.shape[1]) // 2
+
+    # Safety clips
+    pad_h_t = max(0, pad_h_t)
+    pad_w_t = max(0, pad_w_t)
+
+    template_padded = np.pad(unit_cell,
+                             ((pad_h_t, full_h - unit_cell.shape[0] - pad_h_t),
+                              (pad_w_t, full_w - unit_cell.shape[1] - pad_w_t)),
+                             mode='constant', constant_values=0)
+
+    # Normalize template for ZNCC score calculation
+    std_tmpl = np.std(unit_cell)
+    norm_tmpl = (unit_cell - np.mean(unit_cell)) / (std_tmpl + 1e-9)
+
+    for r in range(Ny):
+        for c in range(Nx):
+            # A. Calculate Rotated Centroid
+            cy = r * py + py / 2
+            cx = c * px + px / 2
+
+            # B. Extract Raw Patch
+            raw_patch = pipeline._safe_extract(img_rot, cy, cx, full_h, full_w)
+
+            # C. Sub-Pixel Registration
+            # Align raw patch to the padded template
+            if raw_patch.shape != template_padded.shape:
+                continue
+
+            try:
+                shift_vec, error, _ = phase_cross_correlation(
+                    template_padded, raw_patch, upsample_factor=100
+                )
+            except:
+                continue  # Skip if registration fails
+
+            # D. Warp (Align)
+            tform = AffineTransform(translation=shift_vec)
+            warped = warp(raw_patch, tform, mode='reflect')
+
+            # E. Crop to Unit Cell Size
+            cy_p, cx_p = warped.shape[0] // 2, warped.shape[1] // 2
+            aligned_cell = warped[cy_p - h // 2: cy_p + h // 2,
+                           cx_p - w // 2: cx_p + w // 2]
+
+            if aligned_cell.shape != (h, w):
+                continue
+
+            # F. Purification (Correlation Check)
+            # Compare the aligned cell content to the unit cell content
+            std_cell = np.std(aligned_cell)
+            if std_cell == 0: continue
+
+            norm_cell = (aligned_cell - np.mean(aligned_cell)) / std_cell
+            score = np.mean(norm_cell * norm_tmpl)
+
+            if score < correlation_threshold:
+                continue  # Filter out bad cells
+
+            # G. Calculate Global Coordinates
+            # We must map the "Rotated Grid Center" back to "Global Original Pixels"
+            # 1. Apply Shift: The feature detected is at (cy, cx) - shift
+            #    (Registration says "Shift image by V to match template".
+            #    So the feature center is shifted by -V relative to grid center).
+            #    Actually, standard phase_corr shift vector is [y,x] to move Moving->Ref.
+            #    So feature is at GridCenter - Shift.
+
+            # Local adjustment in rotated space
+            feat_y_rot = cy - shift_vec[0]
+            feat_x_rot = cx - shift_vec[1]
+
+            # 2. Reverse Rotation (Back to Global)
+            # Rotate point (feat_y_rot, feat_x_rot) by +angle around image center
+            if abs(angle) > 0.1:
+                rad = np.radians(angle)  # Positive angle to undo
+                dy = feat_y_rot - cy_img
+                dx = feat_x_rot - cx_img
+
+                global_y = cy_img + (dx * np.sin(rad) + dy * np.cos(rad))
+                global_x = cx_img + (dx * np.cos(rad) - dy * np.sin(rad))
+            else:
+                global_y = feat_y_rot
+                global_x = feat_x_rot
+
+            # H. Store
+            meta_obj = CellMeta(
+                image=aligned_cell,
+                global_y=global_y,
+                global_x=global_x,
+                grid_index=(r, c),
+                correlation_score=score
+            )
+            purified_data.append(meta_obj)
+
+    print(f"Purification Complete: Kept {len(purified_data)} / {Ny * Nx} cells.")
+    return purified_data
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage.measure import label, regionprops
+from skimage.morphology import opening, closing, disk
+from skimage.filters import threshold_otsu
+from skimage.util import img_as_float
+from dataclasses import dataclass
+
+
+@dataclass
+class DefectResult:
+    score: float  # Main scalar metric (e.g., Area)
+    defect_mask: np.ndarray
+    bbox: tuple  # (min_row, min_col, max_row, max_col)
+    max_dimension: float  # Length/Width of the defect
+    defect_type: str
+
+
+class DefectMetrology:
+    def __init__(self, sensitivity_sigma=3.0):
+        """
+        Parameters:
+        - sensitivity_sigma: Z-score threshold. Lower = more sensitive,
+                             Higher = detects only obvious defects.
+        """
+        self.sigma = sensitivity_sigma
+
+    def measure_bridge(self, test_img, ref_img, lines_are_dark=True):
+        """
+        Detects 'Bridge' anomalies (Short circuits).
+        A Bridge is EXTRA material connecting two lines.
+
+        If lines are DARK (trenches), a bridge is a DARK blob in the bright space.
+        """
+        # 1. Compute Difference
+        diff, std_noise = self._compute_difference(test_img, ref_img)
+
+        # 2. Define Defect Polarity
+        # If lines are dark, a bridge is EXTRA DARK material -> Test is DARKER than Ref
+        # Diff = Test - Ref. We look for highly NEGATIVE values.
+        if lines_are_dark:
+            defect_signal = -diff  # Invert so defect becomes positive
+        else:
+            defect_signal = diff  # Bridge is bright material
+
+        # 3. Segment
+        return self._quantify_defect(defect_signal, std_noise, "Bridge")
+
+    def measure_cut(self, test_img, ref_img, lines_are_dark=True):
+        """
+        Detects 'Cut' anomalies (Open circuits).
+        A Cut is MISSING material in a line.
+
+        If lines are DARK, a cut is a BRIGHT gap in the dark line.
+        """
+        # 1. Compute Difference
+        diff, std_noise = self._compute_difference(test_img, ref_img)
+
+        # 2. Define Defect Polarity
+        # If lines are dark, a cut is BRIGHTER than it should be -> Test > Ref
+        # Diff = Test - Ref. We look for highly POSITIVE values.
+        if lines_are_dark:
+            defect_signal = diff
+        else:
+            defect_signal = -diff  # Cut is missing bright material -> Darker
+
+        # 3. Segment
+        return self._quantify_defect(defect_signal, std_noise, "Cut")
+
+    def _compute_difference(self, img, ref):
+        """
+        Normalize and subtract images to isolate changes.
+        """
+        # Float conversion
+        test_f = img_as_float(img)
+        ref_f = img_as_float(ref)
+
+        # Histogram Matching (Gain/Offset Correction)
+        # We align the mean and std of the test image to the reference
+        # This prevents "global brightness" from looking like a defect.
+        test_norm = (test_f - np.mean(test_f)) / (np.std(test_f) + 1e-9)
+        ref_norm = (ref_f - np.mean(ref_f)) / (np.std(ref_f) + 1e-9)
+
+        # Difference Map
+        diff = test_norm - ref_norm
+
+        # Estimate Noise Floor (Robust Std Dev)
+        # We use median absolute deviation (MAD) to ignore the defect itself in noise calc
+        noise_floor = 1.4826 * np.median(np.abs(diff - np.median(diff)))
+
+        return diff, noise_floor
+
+    def _quantify_defect(self, signal_map, noise_floor, label_name):
+        """
+        Segments the signal map and measures the largest blob.
+        """
+        # 1. Thresholding (Adaptive Z-Score)
+        threshold = self.sigma * noise_floor
+        binary_mask = signal_map > threshold
+
+        # 2. Morphological Cleaning
+        # Remove salt-and-pepper noise (opening) and fuse nearby fragments (closing)
+        clean_mask = opening(binary_mask, disk(1))
+        clean_mask = closing(clean_mask, disk(2))
+
+        # 3. Measure Connected Components
+        labeled_img = label(clean_mask)
+        regions = regionprops(labeled_img)
+
+        if not regions:
+            # Return a "Zero" result if no defect found
+            return DefectResult(0.0, np.zeros_like(clean_mask), (0, 0, 0, 0), 0.0, label_name)
+
+        # 4. Find the Dominant Defect (Largest Area)
+        largest_defect = max(regions, key=lambda r: r.area)
+
+        # 5. Extract Metrics
+        # Severity Metric 1: Total Pixels (Mass)
+        score_area = largest_defect.area
+
+        # Severity Metric 2: Max Dimension (e.g., Width of the bridge)
+        # Major axis length of the ellipse fitting the blob
+        max_dim = largest_defect.major_axis_length
+
+        return DefectResult(
+            score=score_area,
+            defect_mask=clean_mask,
+            bbox=largest_defect.bbox,
+            max_dimension=max_dim,
+            defect_type=label_name
+        )
+
+
+# --- Visualization Helper ---
+def plot_defect_analysis(test_img, ref_img, result: DefectResult):
+    fig, ax = plt.subplots(1, 3, figsize=(12, 4))
+
+    # Raw Image
+    ax[0].imshow(test_img, cmap='gray')
+    ax[0].set_title("Input Image")
+
+    # Reference
+    ax[1].imshow(ref_img, cmap='gray')
+    ax[1].set_title("Reference Unit Cell")
+
+    # Defect Overlay
+    # Create a Red overlay for the defect mask
+    overlay = np.zeros((*test_img.shape, 4))  # RGBA
+    overlay[result.defect_mask, 0] = 1.0  # Red Channel
+    overlay[result.defect_mask, 3] = 0.6  # Alpha
+
+    ax[2].imshow(test_img, cmap='gray')
+    ax[2].imshow(overlay)
+
+    # Draw Bounding Box
+    minr, minc, maxr, maxc = result.bbox
+    rect = plt.Rectangle((minc, minr), maxc - minc, maxr - minr,
+                         fill=False, edgecolor='yellow', linewidth=2)
+    ax[2].add_patch(rect)
+
+    ax[2].set_title(f"Detected {result.defect_type}\nScore (Pixels): {result.score}")
+
+    plt.tight_layout()
+    plt.show()
+
+# --- RUN ---
+if __name__ == "__main__":
+    try:
+        path = r'C:\Users\user\Downloads\Screenshot 2025-12-17 201334.png'
+        img = np.array(Image.open(path).convert('L'))
+
+        pipeline = SEMLatticePro(
+            approx_period_range=(10, 300),
+            max_instances_y=3,
+            max_instances_x=10
+        )
+
+        res, cells = pipeline.run(img)
+        plot_results(res, cells)
+
+        # --- Example Usage ---
+        # Assuming you ran: res, cells = pipeline.run(img)
+        # 1. Pick a patch index (e.g., the 5th patch)
+        # 2. Pick a coordinate (y, x) where you see a tiny dot/defect
+        try:
+            # Example: Analyze Patch #0, at pixel y=50, x=15
+            # Replace (50, 15) with the actual coordinate of your tiny defect
+            analyze_anomaly(cells, res, patch_idx=0, target_yx=(50, 15))
+        except Exception as e:
+            print(f"Could not run analysis: {e}")
+
+        # --- Example Usage ---
+        # Assuming 'res' and 'cells' are available from your pipeline run
+        # Define ellipse: Center (y,x), Axes (Height, Width), Angle (deg)
+        try:
+            # Example: Analyze Patch #5, Ellipse at (50, 15), Size 10x6 pixels, Rotated 45 deg
+            # 3. Analyze Global Region
+            # 2. Simulate User Click on Global Image
+            # (Replace these with actual mouse coordinates)
+            # 2. Simulate User Input (Global Coordinate)
+            # ------------------------------------------
+            # Imagine the user clicked on a defect at pixel (y=150, x=340) on the ORIGINAL image.
+            # In a real GUI, you would get these from a mouse event.
+            user_click_y = 150
+            user_click_x = 340
+            print(f"\nUser clicked Global Coordinate: (y={user_click_y}, x={user_click_x})")
+
+            # 3. Convert Global -> Local
+            # --------------------------
+            # This finds the correct cell, aligns it, and calculates where the click falls inside it.
+            try:
+                local_yx, aligned_cell = convert_global_to_local(
+                    global_yx=(user_click_y, user_click_x),
+                    pipeline=pipeline,
+                    image=img,
+                    result_grid=res
+                )
+
+                local_y, local_x = local_yx
+                print(f"Converted to Local Aligned Coordinate: (y={local_y:.2f}, x={local_x:.2f})")
+
+            except Exception as e:
+                print(f"Analysis failed: {e}")
+            analyze_anomaly_ellipse(cells, res, patch_idx=0,
+                                    center_yx=(50, 15),
+                                    axes_len=(10, 6),
+                                    angle=45)
+
+            analyze_pca_modes(cells, components_to_plot=(1, 2, 5))
+
+            # Run purification
+            purified_cells = purify_and_localize_cells(
+                pipeline=pipeline,
+                original_image=img,
+                unit_cell=res.unit_cell,
+                correlation_threshold=0.6  # Stricter than default
+            )
+
+            # Access Data
+            print(f"\n--- First 3 Valid Cells ---")
+            for i, item in enumerate(purified_cells[:3]):
+                print(
+                    f"Cell #{i}: Grid{item.grid_index} -> Global(x={item.global_x:.1f}, y={item.global_y:.1f}) | Score: {item.correlation_score:.2f}")
+
+                # You can now plot item.image directly
+                # plt.imshow(item.image)
+
+        # Assuming you have:
+        # 1. 'unit_cell': From your pipeline (res.unit_cell)
+        # 2. 'test_cell': A single cell image you want to check
+
+        # metrology = DefectMetrology(sensitivity_sigma=3.0)
+        #
+        # # -- Case 1: Checking for a Bridge --
+        # # Note: In your images, the lines look DARK (black vertical strips), so lines_are_dark=True
+        # bridge_result = metrology.measure_bridge(test_cell, unit_cell, lines_are_dark=True)
+        #
+        # if bridge_result.score > 10:  # Filter small noise
+        #     print(f"BRIDGE DETECTED! Severity: {bridge_result.score:.0f} pixels")
+        #     plot_defect_analysis(test_cell, unit_cell, bridge_result)
+        # else:
+        #     print("No bridge detected.")
+        #
+        # # -- Case 2: Checking for a Cut --
+        # cut_result = metrology.measure_cut(test_cell, unit_cell, lines_are_dark=True)
+        #
+        # if cut_result.score > 10:
+        #     print(f"CUT DETECTED! Severity: {cut_result.score:.0f} pixels")
+        #     plot_defect_analysis(test_cell, unit_cell, cut_result)
+        # else:
+        #     print("No cut detected.")
+        except Exception as e:
+            print(f"Analysis failed: {e}")
+
+
+
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
