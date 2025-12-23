@@ -1,0 +1,98 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage.segmentation import random_walker
+from skimage.exposure import rescale_intensity
+
+def segment_fuzzy_anomaly_random_walker(patch, inside_yx, outside_yx_list, beta=130):
+    """
+    Segments a fuzzy object using the Random Walker algorithm.
+    
+    Parameters:
+    -----------
+    patch : np.ndarray
+        The grayscale image of the cell.
+    inside_yx : tuple
+        (y, x) coordinate of a SURE defect pixel (Foreground).
+    outside_yx_list : list of tuples
+        List of (y, x) coordinates of SURE background pixels.
+    beta : float
+        Penalization coefficient. High beta = difficult diffusion (sticks to similar colors).
+        Low beta = easy diffusion (blob grows large).
+        130 is a good starting point for SEM.
+    
+    Returns:
+    --------
+    prob_map : np.ndarray
+        The probability (0.0 to 1.0) that a pixel belongs to the defect.
+    """
+    
+    # 1. Create Marker Map
+    # 0 = Unknown, 1 = Background, 2 = Foreground
+    markers = np.zeros(patch.shape, dtype=np.uint8)
+    
+    # Mark Background (Label 1)
+    for y, x in outside_yx_list:
+        # Safety check for bounds
+        if 0 <= y < patch.shape[0] and 0 <= x < patch.shape[1]:
+            markers[y, x] = 1
+            
+    # Mark Foreground (Label 2)
+    fy, fx = inside_yx
+    markers[fy, fx] = 2
+    
+    # 2. Run Random Walker
+    # This solves the diffusion equation.
+    # mode='bf' (Brute Force) is fine for small patches and mathematically exact.
+    prob_labels = random_walker(patch, markers, beta=beta, mode='bf')
+    
+    # Random walker returns labels (1 and 2). We want a mask.
+    # However, scikit-image's implementation returns the discrete labels (1 or 2).
+    # To get the "Soft" probability map, we need `return_full_prob=True`.
+    
+    prob_maps = random_walker(patch, markers, beta=beta, mode='bf', return_full_prob=True)
+    
+    # prob_maps[0] is probability of Label 1 (Background)
+    # prob_maps[1] is probability of Label 2 (Foreground - Defect)
+    defect_probability = prob_maps[1]
+    
+    return defect_probability
+
+# --- Visualization ---
+def visualize_soft_segmentation(patch, prob_map):
+    fig, ax = plt.subplots(1, 3, figsize=(12, 4))
+    
+    ax[0].imshow(patch, cmap='gray')
+    ax[0].set_title("Input (Fuzzy)")
+    
+    # Plot Probability
+    im = ax[1].imshow(prob_map, cmap='magma', vmin=0, vmax=1)
+    ax[1].set_title("Random Walker Probability\n(Soft Edge)")
+    plt.colorbar(im, ax=ax[1])
+    
+    # Plot Thresholded (e.g., > 50%)
+    mask_50 = prob_map > 0.5
+    ax[2].imshow(patch, cmap='gray')
+    ax[2].contour(mask_50, colors='lime', linewidths=2)
+    ax[2].set_title("Segmentation (>50% Prob)")
+    
+    plt.show()
+
+# --- USAGE EXAMPLE ---
+# Assume we have 'aligned_cell' from your pipeline
+# We assume the center is Defect, and the 4 corners are Background
+if __name__ == "__main__":
+    # Create synthetic fuzzy blob
+    H, W = 100, 100
+    Y, X = np.ogrid[:H, :W]
+    dist = np.sqrt((Y-50)**2 + (X-50)**2)
+    # Sigmoid fuzziness
+    blob = 1 / (1 + np.exp((dist - 15) / 2)) 
+    noisy_blob = blob + np.random.normal(0, 0.1, (H, W))
+    
+    # Define seeds
+    foreground = (50, 50) # Center
+    backgrounds = [(5, 5), (5, 95), (95, 5), (95, 95)] # Corners
+    
+    # Run
+    prob = segment_fuzzy_anomaly_random_walker(noisy_blob, foreground, backgrounds, beta=130)
+    visualize_soft_segmentation(noisy_blob, prob)
