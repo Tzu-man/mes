@@ -1,0 +1,216 @@
+import numpy as np
+import cv2
+from skimage.util import img_as_float
+from skimage.transform import rotate, warp, AffineTransform
+from skimage.registration import phase_cross_correlation
+from skimage.draw import polygon
+
+def propagate_user_marks(image, pipeline, result_grid, user_polygons):
+    """
+    Propagates user-marked polygons from the Unit Cell to EVERY cell in the original image.
+    
+    Performs precision alignment for each cell individually to account for 
+    local distortions or drift, then maps the polygons back to the original image coordinates.
+
+    Parameters:
+    -----------
+    image : np.ndarray
+        The original full-size raw image (before deskewing).
+    pipeline : SEMLatticePro
+        The pipeline instance (must contain .meta).
+    result_grid : CellGrid
+        The output from pipeline.run(). Contains the unit_cell.
+    user_polygons : list of dicts
+        List of polygons drawn on the Unit Cell.
+        Format: [{'label': 1, 'coords': np.array([[y,x],...])}, ...]
+        'coords' should be (N, 2) array relative to result_grid.unit_cell.
+
+    Returns:
+    --------
+    segmentation_map : np.ndarray
+        An integer map the same size as 'image'. 
+        0 = Background.
+        1, 2, 3... = The values corresponding to the user's polygons.
+    """
+    
+    # 1. Retrieve Geometry & Pre-process
+    meta = pipeline.meta
+    if not meta: raise ValueError("Pipeline metadata missing.")
+    
+    py, px = meta['py'], meta['px']
+    h, w = meta['h'], meta['w']
+    ph, pw = meta['ph'], meta['pw']
+    angle = meta['angle']
+    
+    # We work on the deskewed image for alignment, then project back
+    img_float = img_as_float(image)
+    if abs(angle) > 0.1:
+        img_deskewed = rotate(img_float, -angle, mode='reflect')
+    else:
+        img_deskewed = img_float
+        
+    full_h, full_w = img_deskewed.shape
+    seg_map = np.zeros((full_h, full_w), dtype=np.uint16)
+    
+    # Grid Dimensions
+    Ny, Nx = result_grid.grid_shape
+    template = result_grid.unit_cell
+
+    # Extraction size (includes padding for robust registration)
+    ext_h, ext_w = h + 2*ph, w + 2*pw
+    
+    # Pre-calculate center of rotation for the final projection
+    cy_img, cx_img = full_h / 2.0, full_w / 2.0
+    rot_rad = np.radians(angle) # Positive angle to rotate BACK to raw
+
+    print(f"Propagating {len(user_polygons)} polygons to {Ny*Nx} cells...")
+
+    # 2. Iterate Over Every Cell
+    for r in range(Ny):
+        for c in range(Nx):
+            # A. Approximate Grid Position
+            # Centroid of the cell in the deskewed image
+            cell_cy = r * py + py/2
+            cell_cx = c * px + px/2
+            
+            # B. Extract Patch (Deskewed Frame)
+            # We use the pipeline's safe extraction to handle edges
+            raw_patch = pipeline._safe_extract(img_deskewed, cell_cy, cell_cx, ext_h, ext_w)
+            
+            # Skip if patch is incomplete (edge of image)
+            if raw_patch.shape != (ext_h, ext_w):
+                continue
+
+            # C. Sub-Pixel Registration (The Precision Step)
+            # Align this specific cell to the Master Template
+            
+            # Pad template to match the extracted patch size
+            pad_h_t = (ext_h - template.shape[0]) // 2
+            pad_w_t = (ext_w - template.shape[1]) // 2
+            
+            template_padded = np.pad(template, 
+                                     ((pad_h_t, ext_h - template.shape[0] - pad_h_t), 
+                                      (pad_w_t, ext_w - template.shape[1] - pad_w_t)),
+                                     mode='edge')
+            
+            try:
+                # shift_vec: How much the CELL must move to match TEMPLATE
+                shift_vec, _, _ = phase_cross_correlation(template_padded, raw_patch, upsample_factor=10)
+            except:
+                shift_vec = np.array([0, 0])
+
+            # D. Transform User Polygons
+            for poly_obj in user_polygons:
+                label_val = poly_obj['label']
+                poly_coords = poly_obj['coords'].copy() # Shape (N, 2) Y,X
+                
+                # --- Transform 1: Unit Cell -> Local Extracted Patch ---
+                # The user drew on the 'template'.
+                # The 'raw_patch' is shifted by -shift_vec relative to template?
+                # Let's check logic: 
+                # If shift_vec is (10, 0), it means raw_patch shifted RIGHT by 10 aligns with template.
+                # So raw_patch is at -10. 
+                # So the feature at 50 on template is at 60 on raw_patch.
+                # Transform: Coord_Patch = Coord_Template - shift_vec
+                poly_patch_y = poly_coords[:, 0] + pad_h_t - shift_vec[0]
+                poly_patch_x = poly_coords[:, 1] + pad_w_t - shift_vec[1]
+                
+                # --- Transform 2: Local Patch -> Global Deskewed Image ---
+                # The top-left of the extraction window
+                y_start = cell_cy - ext_h//2
+                x_start = cell_cx - ext_w//2
+                
+                poly_global_deskew_y = poly_patch_y + y_start
+                poly_global_deskew_x = poly_patch_x + x_start
+                
+                # --- Transform 3: Deskewed Image -> Raw Input Image (Inverse Rotation) ---
+                if abs(angle) > 0.1:
+                    # Rotate point around image center by +angle
+                    # x' = cx + (x-cx)cos - (y-cy)sin
+                    # y' = cy + (x-cx)sin + (y-cy)cos
+                    
+                    dy = poly_global_deskew_y - cy_img
+                    dx = poly_global_deskew_x - cx_img
+                    
+                    poly_raw_y = cy_img + (dx * np.sin(rot_rad) + dy * np.cos(rot_rad))
+                    poly_raw_x = cx_img + (dx * np.cos(rot_rad) - dy * np.sin(rot_rad))
+                else:
+                    poly_raw_y = poly_global_deskew_y
+                    poly_raw_x = poly_global_deskew_x
+                
+                # E. Rasterize (Draw) onto Segmentation Map
+                rr, cc = polygon(poly_raw_y, poly_raw_x, shape=(full_h, full_w))
+                seg_map[rr, cc] = label_val
+
+    return seg_map
+
+# --- Helper to Visualize the Result ---
+def visualize_propagation(image, seg_map):
+    """
+    Overlays the segmentation map on the original image.
+    """
+    import matplotlib.pyplot as plt
+    
+    # Create an RGB overlay
+    overlay = np.dstack((image, image, image)).astype(np.float32)
+    overlay /= np.max(overlay)
+    
+    # Define colors for labels 1, 2, 3...
+    colors = [
+        [1, 0, 0],   # Label 1: Red
+        [0, 1, 0],   # Label 2: Green
+        [0, 0, 1],   # Label 3: Blue
+        [1, 1, 0]    # Label 4: Yellow
+    ]
+    
+    unique_labels = np.unique(seg_map)
+    for lbl in unique_labels:
+        if lbl == 0: continue
+        
+        # Get color (cycle if more than 4)
+        c = colors[(lbl-1) % len(colors)]
+        
+        mask = (seg_map == lbl)
+        
+        # Blend color
+        overlay[mask] = overlay[mask] * 0.5 + np.array(c) * 0.5
+        
+    plt.figure(figsize=(10, 10))
+    plt.imshow(overlay)
+    plt.title(f"Propagated Segmentation (Found {len(unique_labels)-1} Classes)")
+    plt.axis('off')
+    plt.show()
+
+# --- EXAMPLE USAGE ---
+if __name__ == "__main__":
+    # 1. Assume pipeline has run
+    # res, cells = pipeline.run(img)
+    
+    # 2. Define User Polygons (Drawn on the Unit Cell)
+    # Example: A rectangle in the center and a small triangle corner
+    h_uc, w_uc = res.unit_cell.shape
+    
+    poly_1 = np.array([
+        [h_uc*0.4, w_uc*0.4],
+        [h_uc*0.4, w_uc*0.6],
+        [h_uc*0.6, w_uc*0.6],
+        [h_uc*0.6, w_uc*0.4]
+    ])
+    
+    poly_2 = np.array([
+        [h_uc*0.1, w_uc*0.1],
+        [h_uc*0.2, w_uc*0.1],
+        [h_uc*0.1, w_uc*0.2]
+    ])
+    
+    user_inputs = [
+        {'label': 1, 'coords': poly_1}, # Main body
+        {'label': 2, 'coords': poly_2}  # Corner feature
+    ]
+    
+    # 3. Propagate
+    # Pass the RAW image, not the deskewed one, so the map matches the input file
+    seg_result = propagate_user_marks(img, pipeline, res, user_inputs)
+    
+    # 4. View
+    visualize_propagation(img, seg_result)
